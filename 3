@@ -474,7 +474,7 @@ int main(void)
       ia = filtered_ia;
 
       float vntc = ADC_Channel_Voltage(NTC_ADC_CH);
-      tC = (NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc) - 10);
+      tC = (NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc) );
       tte_sec = RT_UpdateAndCompute_TTE_sec(vbus, fabsf(ia), soc);
 
       if (!soc_inited) {
