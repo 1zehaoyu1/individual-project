@@ -65,7 +65,7 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 #define TEMP_MOSFET_OFF_C    30.0f
 
 /* 你要的毫安阈值：12mA / 6mA -> 单位换算成 A */
-#define I_OVERCURRENT_A      0.050f
+#define I_OVERCURRENT_A      0.4f
 #define I_UNDERCURRENT_A     0.006f
 #define LOAD_FAULT_MS        10000U
 #define CAPACITY_AH      2.2f
