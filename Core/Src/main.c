@@ -1,4 +1,5 @@
 #include "main.h"
+#include "stm32g4xx_nucleo.h"   /* 改动1：加入 Nucleo BSP 头文件，用来操作板载 B1 */
 
 #include <string.h>
 #include <stdint.h>
@@ -50,9 +51,7 @@ SSD1306 oled;
 #define MOSFET_GPIO_Port GPIOB
 #define MOSFET_Pin       GPIO_PIN_5
 
-/* External button on PA1 (active-low) */
-#define BTN_GPIO_Port GPIOA
-#define BTN_Pin       GPIO_PIN_1
+/* 改动2：删除了原来外部 PA1 按钮的端口/引脚定义，只保留去抖时间 */
 #define BTN_DEBOUNCE_MS 50U
 
 /* Pages */
@@ -66,15 +65,16 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 #define TEMP_MOSFET_OFF_C    30.0f
 
 /* 你要的毫安阈值：12mA / 6mA -> 单位换算成 A */
-#define I_OVERCURRENT_A      0.050f
+#define I_OVERCURRENT_A      0.4f
 #define I_UNDERCURRENT_A     0.006f
 #define LOAD_FAULT_MS        10000U
-#define CAPACITY_AH      2.2f     // 你电池容量，自己改
-#define V_NOM_PACK_V     11.1f    // 你电池标称电压（3S=11.1, 2S=7.4），自己改
+#define CAPACITY_AH      2.2f
+#define V_NOM_PACK_V     11.1f
 
 #define SAMPLE_MS        200U
 #define RT_WIN_SEC       10U
-#define RT_WIN_N         (RT_WIN_SEC*1000U/SAMPLE_MS)  // 10s窗口点数=50
+#define RT_WIN_N         (RT_WIN_SEC*1000U/SAMPLE_MS)
+
 /* SOC */
 static float soc = 0.90f;
 #define SOC_LOW_THRESH     0.30f
@@ -133,14 +133,14 @@ static void INA228_Init_Simple(void)
      AVG[2:0]  : 0=1,1=4,2=16,3=64,4=128,5=256,6=512,7=1024
      VBUSCT    : 5 => 1.052ms
      VSHCT     : 5 => 1.052ms
-     VTCT      : 5 => 1.052ms (即使你不用 temp，这个字段也无害)
-     MODE      : 0xB => Continuous Shunt + Bus   （别用 7，7 是 triggered single-shot）
+     VTCT      : 5 => 1.052ms
+     MODE      : 0xB => Continuous Shunt + Bus
   */
-  uint16_t avg    = 0x3;   // 64x (不是1024)
+  uint16_t avg    = 0x3;
   uint16_t vbusct = 5;
   uint16_t vshct  = 5;
   uint16_t vtct   = 5;
-  uint16_t mode   = 0xB;   // ✅ 连续转换：shunt+bus
+  uint16_t mode   = 0xB;
   uint16_t adc_conf = (uint16_t)((mode << 12) | (vbusct << 9) | (vshct << 6) | (vtct << 3) | (avg << 0));
   INA228_Write16(INA228_REG_ADC_CONF, adc_conf);
 }
@@ -231,14 +231,18 @@ static float SOC_From_OCV_Cell(float v_cell)
   return 0.5f;
 }
 
-/* ===== Button debounce (press event, active-low) ===== */
+/* ===== Button debounce =====
+   改动3：这里不再读外部 PA1，而是改成读板载 B1。
+   仍然保留你原来的“去抖 + 按下一次触发一次事件”逻辑。
+*/
 static uint8_t Button_Pressed_Event(void)
 {
   static uint8_t last = 1;
   static uint8_t stable = 1;
   static uint32_t tick = 0;
 
-  uint8_t r = (uint8_t)HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);
+  /* 读取板载 B1 当前状态 */
+  uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
 
   if (r != last) {
     last = r;
@@ -248,6 +252,8 @@ static uint8_t Button_Pressed_Event(void)
   if ((HAL_GetTick() - tick) >= BTN_DEBOUNCE_MS) {
     if (stable != last) {
       stable = last;
+
+      /* 保持你原来的按下触发方式：稳定到低电平时，认为按下 */
       if (stable == 0) return 1;
     }
   }
@@ -334,22 +340,22 @@ static float RT_UpdateAndCompute_TTE_sec(float vbus, float ia_abs, float soc_now
   static uint32_t idx = 0;
   static uint8_t filled = 0;
 
-  float p = vbus * ia_abs;            // W
+  float p = vbus * ia_abs;
   p_buf[idx] = p;
   idx++;
   if (idx >= RT_WIN_N) { idx = 0; filled = 1; }
 
   uint32_t n = filled ? RT_WIN_N : idx;
-  if (n < 5) return NAN;              // 样本太少先不算
+  if (n < 5) return NAN;
 
   float sum = 0.0f;
   for (uint32_t i = 0; i < n; i++) sum += p_buf[i];
-  float p_avg = sum / (float)n;       // W
+  float p_avg = sum / (float)n;
 
-  if (p_avg < 0.05f) return NAN;      // 功率太小：认为没在放电/不显示
+  if (p_avg < 0.05f) return NAN;
 
-  float e_nom_Wh = V_NOM_PACK_V * CAPACITY_AH; // Wh
-  float e_rem_Wh = soc_now * e_nom_Wh;         // Wh
+  float e_nom_Wh = V_NOM_PACK_V * CAPACITY_AH;
+  float e_rem_Wh = soc_now * e_nom_Wh;
   if (e_rem_Wh < 0.001f) return 0.0f;
 
   float t_hours = e_rem_Wh / p_avg;
@@ -398,6 +404,10 @@ int main(void)
 
   SSD1306_Init(&oled, &OLED_I2C, SSD1306_ADDR);
 
+  /* 改动4：初始化板载 B1。
+     用 GPIO 模式即可，因为你现在的翻页逻辑本来就是轮询 + 去抖，不需要中断。 */
+  BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);
+
   /* Default: MOSFET ON */
   HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_SET);
 
@@ -429,11 +439,11 @@ int main(void)
 
     if (Button_Pressed_Event()) {
       if (fault == FAULT_NONE) {
-    	  if (page == UI_SOC) page = UI_TEMP;
-    	  else if (page == UI_TEMP) page = UI_VOLT;
-    	  else if (page == UI_VOLT) page = UI_CURR;
-    	  else if (page == UI_CURR) page = UI_TIME;
-    	  else page = UI_SOC;
+        if (page == UI_SOC) page = UI_TEMP;
+        else if (page == UI_TEMP) page = UI_VOLT;
+        else if (page == UI_VOLT) page = UI_CURR;
+        else if (page == UI_CURR) page = UI_TIME;
+        else page = UI_SOC;
       }
     }
 
@@ -464,8 +474,9 @@ int main(void)
       ia = filtered_ia;
 
       float vntc = ADC_Channel_Voltage(NTC_ADC_CH);
-      tC = (NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc)-10);
+      tC = (NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc) );
       tte_sec = RT_UpdateAndCompute_TTE_sec(vbus, fabsf(ia), soc);
+
       if (!soc_inited) {
         float vcell = vbus / 3.0f;
         soc = SOC_From_OCV_Cell(vcell);
@@ -503,12 +514,6 @@ int main(void)
         }
       }
 
-      /* ===== MOSFET control you requested =====
-         tC <= 30C : ON
-         tC >  30C : OFF
-         If tC invalid: OFF (safer)
-         fault also forces OFF
-      */
       if (isnan(tC) || (tC > TEMP_MOSFET_OFF_C) || (fault != FAULT_NONE)) {
         HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_RESET);
       } else {
@@ -677,10 +682,8 @@ static void MX_GPIO_Init(void)
 
   HAL_GPIO_WritePin(GPIOB, MOSFET_Pin, GPIO_PIN_RESET);
 
-  GPIO_InitStruct.Pin = BTN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(BTN_GPIO_Port, &GPIO_InitStruct);
+  /* 改动5：这里删掉了原来外部 PA1 按钮的 GPIO 初始化
+     因为现在按钮改成板载 B1，由 BSP_PB_Init() 负责初始化 */
 
   GPIO_InitStruct.Pin = MOSFET_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
