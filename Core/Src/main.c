@@ -64,7 +64,7 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 #define TEMP_HI_C            60.0f
 #define TEMP_MOSFET_OFF_C    30.0f
 
-/* 你要的毫安阈值：12mA / 6mA -> 单位换算成 A */
+/* 过流 / 欠流阈值：400mA / 6mA */
 #define I_OVERCURRENT_A      0.4f
 #define I_UNDERCURRENT_A     0.006f
 #define LOAD_FAULT_MS        10000U
@@ -481,19 +481,20 @@ int main(void)
         float vcell = vbus / 3.0f;
         soc = SOC_From_OCV_Cell(vcell);
         soc_inited = 1;
-      }
-
-      /* Coulomb counting */
-      float Q_as = 2.2f * 3600.0f;
-      soc = soc - (fabsf(ia) * (dt / 1000.0f)) / Q_as;
-      soc = clampf(soc, 0.0f, 1.0f);
-
-      /* Light OCV correction when current small */
-      if (fabsf(ia) < 0.05f) {
-        float vcell = vbus / 3.0f;
-        float soc_ocv = SOC_From_OCV_Cell(vcell);
-        soc = 0.98f * soc + 0.02f * soc_ocv;
+        /* 跳过本次库仑积分：dt = 开机到现在的时间，不代表采样间隔 */
+      } else {
+        /* Coulomb counting */
+        float Q_as = 2.2f * 3600.0f;
+        soc = soc - (fabsf(ia) * (dt / 1000.0f)) / Q_as;
         soc = clampf(soc, 0.0f, 1.0f);
+
+        /* Light OCV correction when current small */
+        if (fabsf(ia) < 0.05f) {
+          float vcell = vbus / 3.0f;
+          float soc_ocv = SOC_From_OCV_Cell(vcell);
+          soc = 0.98f * soc + 0.02f * soc_ocv;
+          soc = clampf(soc, 0.0f, 1.0f);
+        }
       }
 
       if (fault == FAULT_NONE) {
