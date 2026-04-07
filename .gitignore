@@ -1,0 +1,29 @@
+# Build artifacts - object files, dependency files
+Debug/*.o
+Debug/*.d
+Debug/*.su
+Debug/Core/
+Debug/Drivers/
+
+# Compiled binaries (generated, not source)
+Debug/*.elf
+Debug/*.map
+Debug/*.list
+Debug/*.bin
+Debug/*.hex
+Debug/default.size.stdout
+Debug/objects.list
+Debug/objects.mk
+Debug/sources.mk
+Debug/makefile.init
+Debug/makefile.defs
+Debug/makefile.targets
+
+# Keep Debug/makefile (needed to build)
+!Debug/makefile
+
+# macOS
+.DS_Store
+
+# IDE runtime files
+*.launch.bak
