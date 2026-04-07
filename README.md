@@ -1,37 +1,35 @@
-# BMS — STM32G491RE Battery Management System
+# BMS — 锂电池管理系统（毕业设计）
 
-A battery management system firmware for the NUCLEO-G491RE development board.
+基于 STM32G491RE 的 3S 锂电池组管理系统固件。
 
-## Hardware
-- **MCU**: STM32G491RE (ARM Cortex-M4, 170 MHz)
-- **Current/Voltage sensor**: INA228 (I2C)
-- **Temperature sensor**: NTC thermistor (ADC)
-- **Display**: SSD1306 OLED 128x64 (I2C)
-- **Load control**: MOSFET on PB5
+## 硬件平台
 
-## Features
-- SOC estimation (Coulomb counting + OCV correction)
-- Real-time current, voltage, temperature display
-- Time-to-empty calculation
-- Over-temperature & over/under-current fault detection
-- MOSFET thermal cutoff (>30°C → OFF)
-- 5-page UI with button navigation
+| 组件 | 型号 / 接口 |
+|------|------------|
+| 主控 MCU | STM32G491RE（ARM Cortex-M4，170 MHz） |
+| 电流/电压传感器 | INA228（I2C2，20位ADC） |
+| 温度传感器 | NTC 热敏电阻（ADC1） |
+| 显示屏 | SSD1306 OLED 128×64（I2C3） |
+| 负载控制 | MOSFET（GPIO PB5） |
+| 开发板 | NUCLEO-G491RE |
 
-## Project Structure
-```
-Core/
-├── Src/
-│   ├── main.c        # Main application
-│   ├── ssd1306.c     # OLED driver
-│   └── font5x7.c     # Font data
-└── Inc/
-    ├── ssd1306.h
-    └── font5x7.h
-NUCLEO_G491RE_Test.ioc  # STM32CubeMX configuration
-```
+## 主要功能
 
-## Version History
-- **v1.0** — Initial BMS with INA228 + NTC + basic OLED UI
-- **v2.0** — Added Nucleo BSP, refined fault detection
-- **v3.0** — Coulomb counting SOC, TTE estimation, MOSFET thermal control
+- SOC 电量估算（OCV 初始化 + 库仑计数 + 低电流校正）
+- 实时显示电压、电流、温度、SOC、剩余时间
+- 过温 / 过流 / 欠流故障保护
+- MOSFET 热保护（>30°C 自动断开负载）
+- 5页 OLED 界面，按钮翻页
 
+---
+
+## 版本目录
+
+| 版本 | 文件夹 | 主要内容 |
+|------|--------|----------|
+| v1 | [version1/](./version1/) | 基础采集与显示（INA228、NTC、OLED） |
+| v2 | [version2/](./version2/) | 故障检测优化 + Nucleo BSP |
+| v3 | [version3/](./version3/) | 库仑计数SOC + 剩余时间估算 |
+| v4（当前）| [version4/](./version4/) | 完整项目（所有文件，可直接编译） |
+
+每个版本文件夹内都有 `README.md` 说明该版本的改动内容，以及对应的 `main.c` 源代码。

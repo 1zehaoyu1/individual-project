@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh auth:*)",
+      "Bash(ssh -T git@github.com)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://github.com)",
+      "Bash(gh repo:*)",
+      "Bash(gh api:*)",
+      "Bash(git init:*)",
+      "Bash(git remote:*)",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(python3 -c \"import json,sys; tags=json.load\\(sys.stdin\\); print\\([t['ref'] for t in tags]\\)\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git tag:*)",
+      "Bash(git push:*)",
+      "Read(//tmp/**)",
+      "Bash(cp /tmp/main_v1.c /Users/yu/Desktop/BMS/version1/main.c)",
+      "Bash(cp /tmp/main_v2.c /Users/yu/Desktop/BMS/version2/main.c)",
+      "Bash(cp /tmp/main_v3.c /Users/yu/Desktop/BMS/version3/main.c)"
+    ]
+  }
+}
