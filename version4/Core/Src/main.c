@@ -85,12 +85,16 @@ static uint8_t soc_inited = 0;
 #define SOC_HIST_INTERVAL_MS  5000U
 
 /* 电池图标像素参数 */
+/* BAT_Y=16: 图标顶部对齐 page 2 上沿（y16-23）              */
+/* BAT_H=7 : 图标高 7px（y16-22），严格在 page 2 内           */
+/* BAT_NUB_H=3: 突起居中偏移 (7-3)/2=2 → y18-20，在框内     */
+/* 内部可填充高 BAT_H-4=3（边框+内边距各1px），宽上限仍 82px  */
 #define BAT_X       2
-#define BAT_Y      10
+#define BAT_Y      16
 #define BAT_W      86
-#define BAT_H      13
+#define BAT_H       7
 #define BAT_NUB_W   4
-#define BAT_NUB_H   5
+#define BAT_NUB_H   3
 
 /* 历史曲线区域 */
 #define CURVE_Y_TOP  32
@@ -339,35 +343,41 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
   if (soc_percent < 0)   soc_percent = 0;
   if (soc_percent > 100) soc_percent = 100;
 
-  /* 低电量闪烁：每次调用（250 ms）切换 phase，使填充条以 2 Hz 闪烁 */
   static uint8_t blink_phase = 0;
-  if (soc_low) blink_phase ^= 1u;
-  else         blink_phase  = 0u;
 
+  /* page 0: 标题 */
   UI_DrawHeader("SOC");
 
-  /* 电池图标外框 */
-  SSD1306_FillRect(&oled, BAT_X,         BAT_Y,         BAT_W, 1);
-  SSD1306_FillRect(&oled, BAT_X,         BAT_Y+BAT_H-1, BAT_W, 1);
-  SSD1306_FillRect(&oled, BAT_X,         BAT_Y,         1,     BAT_H);
-  SSD1306_FillRect(&oled, BAT_X+BAT_W-1, BAT_Y,         1,     BAT_H);
-  /* 正极突起 */
-  SSD1306_FillRect(&oled, BAT_X+BAT_W, BAT_Y+4, BAT_NUB_W, BAT_NUB_H);
+  /* page 2 (y16-22): 电池图标外框，单行高度 BAT_H=7 */
+  SSD1306_FillRect(&oled, BAT_X,         BAT_Y,           BAT_W, 1);       /* 顶边 y16 */
+  SSD1306_FillRect(&oled, BAT_X,         BAT_Y+BAT_H-1,   BAT_W, 1);       /* 底边 y22 */
+  SSD1306_FillRect(&oled, BAT_X,         BAT_Y,           1,     BAT_H);    /* 左边 */
+  SSD1306_FillRect(&oled, BAT_X+BAT_W-1, BAT_Y,           1,     BAT_H);    /* 右边 */
+  /* 正极突起：居中偏移 (BAT_H-BAT_NUB_H)/2 = 2 → y18-20 */
+  SSD1306_FillRect(&oled, BAT_X+BAT_W, BAT_Y+2, BAT_NUB_W, BAT_NUB_H);
 
-  /* 内部填充（低电量时闪烁隐藏） */
+  /* 内部填充（低电量时按 blink_phase 闪烁隐藏，翻转在渲染后以确保首帧可见）
+   * 内部可用宽：BAT_W - 左边框(1) - 左内边距(1) - 右内边距(1) - 右边框(1) = 82
+   * 内部可用高：BAT_H - 上边框(1) - 上内边距(1) - 下内边距(1) - 下边框(1) = 3 → BAT_H-4 */
   if (!(soc_low && blink_phase)) {
     uint8_t fill_w = (uint8_t)((uint32_t)soc_percent * 82u / 100u);
     if (fill_w > 82u) fill_w = 82u;
     if (fill_w > 0u)
       SSD1306_FillRect(&oled, BAT_X+2, BAT_Y+2, fill_w, BAT_H-4);
   }
+  /* 翻转放在渲染后：保证低电量首帧填充条可见 */
+  if (soc_low) blink_phase ^= 1u;
+  else         blink_phase  = 0u;
 
-  /* 百分比文字 */
+  /* page 2: 百分比文字，与图标同行（x=92 在图标右侧，DrawString 第三参数为 page 编号） */
   snprintf(txt, sizeof(txt), "%d%%", soc_percent);
-  SSD1306_DrawString(&oled, 92, 1, txt);
-  if (soc_low)
-    SSD1306_DrawString(&oled, 92, 3, "LOW");
+  SSD1306_DrawString(&oled, 92, 2, txt);
 
+  /* page 4: 低电量警告（仅 soc_low 时显示，有足够空白） */
+  if (soc_low)
+    SSD1306_DrawString(&oled, 92, 4, "LOW");
+
+  /* page 6: 页脚 */
   UI_DrawFooter();
   SSD1306_Update(&oled);
 }
