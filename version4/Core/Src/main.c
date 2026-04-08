@@ -80,6 +80,28 @@ static float soc = 0.90f;
 static uint8_t soc_inited = 0;
 #define SOC_LOW_THRESH     0.30f
 
+/* F5 SOC 历史采样 */
+#define SOC_HIST_N            64U
+#define SOC_HIST_INTERVAL_MS  5000U
+
+/* 电池图标像素参数 */
+#define BAT_X       2
+#define BAT_Y      10
+#define BAT_W      86
+#define BAT_H      13
+#define BAT_NUB_W   4
+#define BAT_NUB_H   5
+
+/* 历史曲线区域 */
+#define CURVE_Y_TOP  32
+#define CURVE_Y_BOT  47
+#define CURVE_H      16
+
+static float    soc_hist[SOC_HIST_N];
+static uint32_t soc_hist_idx    = 0;
+static uint8_t  soc_hist_filled = 0;
+static uint32_t last_soc_hist   = 0;
+
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
@@ -272,6 +294,12 @@ static uint8_t Button_Pressed_Event(void)
 }
 
 /* ===== UI ===== */
+static void OLED_DrawPixel(uint8_t x, uint8_t y)
+{
+  if (x >= SSD1306_W || y >= SSD1306_H) return;
+  oled.buf[(y / 8u) * SSD1306_W + x] |= (uint8_t)(1u << (y % 8u));
+}
+
 static void UI_DrawHeader(const char *title)
 {
   SSD1306_Clear(&oled);
@@ -283,17 +311,68 @@ static void UI_DrawFooter(void)
   SSD1306_DrawString(&oled, 0, 6, "BTN: NEXT");
 }
 
+static void UI_DrawSOCCurve(void)
+{
+  uint32_t n = soc_hist_filled ? SOC_HIST_N : soc_hist_idx;
+  if (n == 0) return;
+
+  uint32_t oldest  = soc_hist_filled ? soc_hist_idx : 0u;
+  uint32_t x_start = (n < SOC_HIST_N) ? (128u - n * 2u) : 0u;
+
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t ridx   = (oldest + i) % SOC_HIST_N;
+    float    sample = soc_hist[ridx];
+    if (sample < 0.0f) sample = 0.0f;
+    if (sample > 1.0f) sample = 1.0f;
+
+    uint8_t px = (uint8_t)(x_start + i * 2u);
+    uint8_t py = (uint8_t)(CURVE_Y_BOT -
+                 (uint8_t)(sample * (float)(CURVE_H - 1) + 0.5f));
+    OLED_DrawPixel(px,     py);
+    OLED_DrawPixel(px + 1, py);
+  }
+}
+
 static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
 {
-  char l2[24];
-  UI_DrawHeader("SOC");
-
-  if (soc_percent < 0) soc_percent = 0;
+  char txt[8];
+  if (soc_percent < 0)   soc_percent = 0;
   if (soc_percent > 100) soc_percent = 100;
 
-  snprintf(l2, sizeof(l2), "%d%%", soc_percent);
-  SSD1306_DrawString(&oled, 0, 3, l2);
-  if (soc_low) SSD1306_DrawString(&oled, 60, 3, "LOW");
+  /* 低电量闪烁：每次调用（250 ms）切换 phase，使填充条以 2 Hz 闪烁 */
+  static uint8_t blink_phase = 0;
+  if (soc_low) blink_phase ^= 1u;
+  else         blink_phase  = 0u;
+
+  UI_DrawHeader("SOC");
+
+  /* 电池图标外框 */
+  SSD1306_FillRect(&oled, BAT_X,         BAT_Y,         BAT_W, 1);
+  SSD1306_FillRect(&oled, BAT_X,         BAT_Y+BAT_H-1, BAT_W, 1);
+  SSD1306_FillRect(&oled, BAT_X,         BAT_Y,         1,     BAT_H);
+  SSD1306_FillRect(&oled, BAT_X+BAT_W-1, BAT_Y,         1,     BAT_H);
+  /* 正极突起 */
+  SSD1306_FillRect(&oled, BAT_X+BAT_W, BAT_Y+4, BAT_NUB_W, BAT_NUB_H);
+
+  /* 内部填充（低电量时闪烁隐藏） */
+  if (!(soc_low && blink_phase)) {
+    uint8_t fill_w = (uint8_t)((uint32_t)soc_percent * 82u / 100u);
+    if (fill_w > 82u) fill_w = 82u;
+    if (fill_w > 0u)
+      SSD1306_FillRect(&oled, BAT_X+2, BAT_Y+2, fill_w, BAT_H-4);
+  }
+
+  /* 百分比文字 */
+  snprintf(txt, sizeof(txt), "%d%%", soc_percent);
+  SSD1306_DrawString(&oled, 92, 1, txt);
+  if (soc_low)
+    SSD1306_DrawString(&oled, 92, 3, "LOW");
+
+  /* 分隔线 */
+  SSD1306_FillRect(&oled, 0, 27, 128, 1);
+
+  /* 历史曲线 */
+  UI_DrawSOCCurve();
 
   UI_DrawFooter();
   SSD1306_Update(&oled);
@@ -569,6 +648,16 @@ int main(void)
             float soc_ocv = SOC_From_OCV_Cell(vcell);
             soc = 0.98f * soc + 0.02f * soc_ocv;
             soc = clampf(soc, 0.0f, 1.0f);
+          }
+
+          /* SOC 历史记录（F5）：每 5 s 存一次 */
+          if (now - last_soc_hist >= SOC_HIST_INTERVAL_MS) {
+            last_soc_hist = now;
+            soc_hist[soc_hist_idx] = soc;
+            if (++soc_hist_idx >= SOC_HIST_N) {
+              soc_hist_idx    = 0;
+              soc_hist_filled = 1;
+            }
           }
         }
 
