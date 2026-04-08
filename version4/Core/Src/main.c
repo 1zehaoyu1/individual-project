@@ -55,7 +55,7 @@ SSD1306 oled;
 #define BTN_DEBOUNCE_MS 50U
 
 /* Pages */
-typedef enum { UI_SOC = 0, UI_TEMP, UI_VOLT, UI_CURR, UI_TIME } UiPage;
+typedef enum { UI_SOC = 0, UI_SOC_CURVE, UI_TEMP, UI_VOLT, UI_CURR, UI_TIME } UiPage;
 
 /* Faults */
 typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
@@ -368,12 +368,14 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
   if (soc_low)
     SSD1306_DrawString(&oled, 92, 3, "LOW");
 
-  /* 分隔线 */
-  SSD1306_FillRect(&oled, 0, 27, 128, 1);
+  UI_DrawFooter();
+  SSD1306_Update(&oled);
+}
 
-  /* 历史曲线 */
+static void UI_ShowSOCCurvePage(void)
+{
+  UI_DrawHeader("SOC HIST");
   UI_DrawSOCCurve();
-
   UI_DrawFooter();
   SSD1306_Update(&oled);
 }
@@ -587,7 +589,8 @@ int main(void)
 
     if (Button_Pressed_Event()) {
       if (fault == FAULT_NONE) {
-        if (page == UI_SOC) page = UI_TEMP;
+        if (page == UI_SOC)       page = UI_SOC_CURVE;
+        else if (page == UI_SOC_CURVE) page = UI_TEMP;
         else if (page == UI_TEMP) page = UI_VOLT;
         else if (page == UI_VOLT) page = UI_CURR;
         else if (page == UI_CURR) page = UI_TIME;
@@ -699,11 +702,12 @@ int main(void)
         int soc_percent = (int)(soc * 100.0f + 0.5f);
         uint8_t soc_low = (soc < SOC_LOW_THRESH) ? 1 : 0;
 
-        if (page == UI_SOC) UI_ShowSOC(soc_percent, soc_low);
-        else if (page == UI_TEMP) UI_ShowTemp(tC);
-        else if (page == UI_VOLT) UI_ShowVolt(vbus);
-        else if (page == UI_CURR) UI_ShowCurr(ia);
-        else UI_ShowTime(tte_sec);
+        if (page == UI_SOC)            UI_ShowSOC(soc_percent, soc_low);
+        else if (page == UI_SOC_CURVE) UI_ShowSOCCurvePage();
+        else if (page == UI_TEMP)      UI_ShowTemp(tC);
+        else if (page == UI_VOLT)      UI_ShowVolt(vbus);
+        else if (page == UI_CURR)      UI_ShowCurr(ia);
+        else                           UI_ShowTime(tte_sec);
 
         if (soc_low) {
           SSD1306_DrawString(&oled, 0, 5, "SOC TOO LOW");
