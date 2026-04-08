@@ -270,16 +270,43 @@ static float SOC_From_OCV_Cell(float v_cell)
 
 /* ===== Button debounce =====
    改动3：这里不再读外部 PA1，而是改成读板载 B1。
-   仍然保留你原来的“去抖 + 按下一次触发一次事件”逻辑。
+   仍然保留你原来的”去抖 + 按下一次触发一次事件”逻辑。
+
+   Button_Debounce_Sync()：在长时间不轮询按钮之后（例如 Warmup_Phase 结束后）
+   调用一次，将状态机的 last/stable/tick 全部对齐到当前物理电平和当前 tick，
+   避免因 tick=0 与 HAL_GetTick() 差值过大而在首次轮询时产生假按键事件。
 */
+/* 文件级标志：Button_Debounce_Sync() 置位，Button_Pressed_Event() 消费。
+   必须定义在两个函数之前，避免前向引用。                          */
+static volatile uint8_t g_btn_sync_needed = 0U;
+
+static void Button_Debounce_Sync(void)
+{
+  /* 由于 last/stable/tick 是 Button_Pressed_Event 内的 static local，
+     无法从外部直接赋值。通过文件级 flag 通知函数在下次入口处执行同步，
+     而不依赖外部访问 static local。                                */
+  g_btn_sync_needed = 1U;
+}
+
 static uint8_t Button_Pressed_Event(void)
 {
-  static uint8_t last = 1;
-  static uint8_t stable = 1;
-  static uint32_t tick = 0;
+  static uint8_t  last   = 1U;
+  static uint8_t  stable = 1U;
+  static uint32_t tick   = 0U;
 
   /* 读取板载 B1 当前状态 */
   uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
+
+  /* 同步请求：将三个 static 变量全部对齐到当前物理状态和当前时刻，
+     确保不会因 tick=0 导致去抖窗口在首次调用时就已过期。
+     注意：不产生任何事件——stable 和 last 均设为 r，跳过 stable != last 条件。 */
+  if (g_btn_sync_needed) {
+    g_btn_sync_needed = 0U;
+    last   = r;
+    stable = r;
+    tick   = HAL_GetTick();
+    return 0U;   /* 同步帧：本次调用不产生事件 */
+  }
 
   if (r != last) {
     last = r;
@@ -291,10 +318,10 @@ static uint8_t Button_Pressed_Event(void)
       stable = last;
 
       /* 保持你原来的按下触发方式：稳定到低电平时，认为按下 */
-      if (stable == 0) return 1;
+      if (stable == 0U) return 1U;
     }
   }
-  return 0;
+  return 0U;
 }
 
 /* ===== UI ===== */
@@ -583,6 +610,13 @@ int main(void)
   }
 
   Warmup_Phase();
+
+  /* 预热阶段（约 3000 ms）期间完全不轮询按钮，导致 Button_Pressed_Event
+     内部 tick=0 与 HAL_GetTick()≈3000 之间存在巨大差值，首次轮询时去抖
+     窗口立即过期，若按钮电平与初始假设不符就会产生假按键事件。
+     此处请求同步：下次 Button_Pressed_Event() 调用时将 last/stable/tick
+     全部对齐到当前物理电平和当前时刻，不产生任何事件。              */
+  Button_Debounce_Sync();
 
   while (1)
   {
