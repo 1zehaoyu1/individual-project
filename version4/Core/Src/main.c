@@ -280,12 +280,27 @@ static uint32_t  g_edit_enter_tick = 0U;
 #define EDIT_TIMEOUT_MS  8000U
 
 /* ===== Button (duration-aware) ===== */
-typedef enum { BTN_NONE = 0, BTN_SHORT, BTN_MEDIUM, BTN_LONG } BtnEvent;
-#define BTN_SHORT_MS   800U
+typedef enum { BTN_NONE = 0, BTN_SHORT, BTN_LONG } BtnEvent;
+#define BTN_SHORT_MS   500U
 #define BTN_LONG_MS   5000U
 static uint32_t g_btn_press_start = 0U;
 static uint8_t  g_btn_pressing    = 0U;
 static BtnEvent g_btn_event       = BTN_NONE;
+
+/* ===== Transient hint ===== */
+static char     g_hint_text[24]  = {0};
+static uint32_t g_hint_set_tick  = 0U;
+#define HINT_DURATION_MS  1500U
+
+static void Hint_Set(const char *s) {
+  strncpy(g_hint_text, s, sizeof(g_hint_text) - 1U);
+  g_hint_text[sizeof(g_hint_text) - 1U] = '\0';
+  g_hint_set_tick = HAL_GetTick();
+}
+static const char *Hint_Get(void) {
+  if (g_hint_text[0] == '\0') return NULL;
+  return ((HAL_GetTick() - g_hint_set_tick) < HINT_DURATION_MS) ? g_hint_text : NULL;
+}
 
 /* ===== Button debounce =====
    改动3：这里不再读外部 PA1，而是改成读板载 B1。
@@ -343,9 +358,8 @@ static void Button_Update(void)
       uint32_t dur = HAL_GetTick() - g_btn_press_start;
       g_btn_pressing = 0U;
       candidate      = 0U;
-      if      (dur < BTN_SHORT_MS) g_btn_event = BTN_SHORT;
-      else if (dur < BTN_LONG_MS)  g_btn_event = BTN_MEDIUM;
-      else                         g_btn_event = BTN_LONG;
+      if (dur < BTN_SHORT_MS) g_btn_event = BTN_SHORT;
+      else                    g_btn_event = BTN_LONG;
     }
   }
 }
@@ -373,11 +387,6 @@ static void UI_DrawHeader(const char *title)
 {
   SSD1306_Clear(&oled);
   SSD1306_DrawString(&oled, 0, 0, title);
-}
-
-static void UI_DrawFooter(void)
-{
-  SSD1306_DrawString(&oled, 0, 6, "BTN: NEXT");
 }
 
 static void UI_DrawSOCCurve(void)
@@ -442,8 +451,8 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
   if (soc_low)
     SSD1306_DrawString(&oled, 92, 4, "LOW");
 
-  /* page 6: 页脚 */
-  UI_DrawFooter();
+  /* page 6: 短暂提示（按键后 1.5s） */
+  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   SSD1306_Update(&oled);
 }
 
@@ -451,7 +460,7 @@ static void UI_ShowSOCCurvePage(void)
 {
   UI_DrawHeader("SOC HIST");
   UI_DrawSOCCurve();
-  UI_DrawFooter();
+  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   SSD1306_Update(&oled);
 }
 
@@ -474,13 +483,13 @@ static void UI_ShowTemp(float tC, uint8_t edit_mode, float edit_val)
     int ei = (int)edit_val;
     snprintf(l2, sizeof(l2), "[%d C]", ei);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    SSD1306_DrawString(&oled, 0, 6, "<  TEMP  >");
+    SSD1306_DrawString(&oled, 0, 6, "S:+  L:save");
   } else {
     /* 正常：显示当前生效阈值 */
     int gi = (int)g_mosfet_off_temp;
     snprintf(l2, sizeof(l2), "set:%d C", gi);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    UI_DrawFooter();
+    { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   }
   SSD1306_Update(&oled);
 }
@@ -499,7 +508,7 @@ static void UI_ShowVolt(float v)
   }
 
   SSD1306_DrawString(&oled, 0, 3, l2);
-  UI_DrawFooter();
+  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   SSD1306_Update(&oled);
 }
 
@@ -514,7 +523,7 @@ static void UI_ShowCurr(float ia)
   snprintf(l2, sizeof(l2), "%d.%d mA", mi, md);
 
   SSD1306_DrawString(&oled, 0, 3, l2);
-  UI_DrawFooter();
+  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   SSD1306_Update(&oled);
 }
 
@@ -562,7 +571,7 @@ static void UI_ShowTime(float tte_sec)
   }
 
   SSD1306_DrawString(&oled, 0, 3, l2);
-  UI_DrawFooter();
+  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   SSD1306_Update(&oled);
 }
 
@@ -730,31 +739,29 @@ int main(void)
 
     if (g_mode == MODE_NORMAL) {
       if (ev == BTN_SHORT && fault == FAULT_NONE) {
-        if (page == UI_SOC)            page = UI_SOC_CURVE;
-        else if (page == UI_SOC_CURVE) page = UI_TEMP;
-        else if (page == UI_TEMP)      page = UI_VOLT;
-        else if (page == UI_VOLT)      page = UI_CURR;
-        else if (page == UI_CURR)      page = UI_TIME;
-        else                           page = UI_SOC;
-      } else if ((ev == BTN_MEDIUM || ev == BTN_LONG) &&
-                 fault == FAULT_NONE && page == UI_TEMP) {
+        /* 短按（<0.5s）：翻页 */
+        page = (page == UI_TIME) ? UI_SOC : (UiPage)(page + 1);
+        Hint_Set("Next Page");
+      } else if (ev == BTN_LONG && fault == FAULT_NONE) {
+        /* 长按（>=5s）：进入设置模式，切至 TEMP 页 */
+        page              = UI_TEMP;
         g_mode            = MODE_EDIT_TEMP;
         g_edit_val        = g_mosfet_off_temp;
         g_edit_enter_tick = now;
+        Hint_Set("Setting Mode");
       }
     } else {  /* MODE_EDIT_TEMP */
       if (ev == BTN_SHORT) {
-        g_edit_val -= MOSFET_OFF_TEMP_STEP;
-        if (g_edit_val < MOSFET_OFF_TEMP_MIN) g_edit_val = MOSFET_OFF_TEMP_MIN;
-        g_edit_enter_tick = now;
-      } else if (ev == BTN_MEDIUM) {
+        /* 短按：循环递增温度阈值 */
         g_edit_val += MOSFET_OFF_TEMP_STEP;
-        if (g_edit_val > MOSFET_OFF_TEMP_MAX) g_edit_val = MOSFET_OFF_TEMP_MAX;
+        if (g_edit_val > MOSFET_OFF_TEMP_MAX) g_edit_val = MOSFET_OFF_TEMP_MIN;
         g_edit_enter_tick = now;
       } else if (ev == BTN_LONG) {
+        /* 长按：保存并退出 */
         g_mosfet_off_temp = g_edit_val;
         Flash_SaveSettings();
         g_mode = MODE_NORMAL;
+        Hint_Set("Saved");
       }
       if (now - g_edit_enter_tick >= EDIT_TIMEOUT_MS) {
         g_mode = MODE_NORMAL;               /* 超时放弃，不保存 */
@@ -871,21 +878,15 @@ int main(void)
         else if (page == UI_CURR)      UI_ShowCurr(ia);
         else                           UI_ShowTime(tte_sec);
 
-        /* 按压期间在底部叠加进度条（SSD1306_Update 已在各 Show 函数中调用，
-           进度条需要在之后单独叠加再刷新） */
+        /* 按压期间底部叠加进度条（进满 5s 即触发长按） */
         if (g_btn_pressing) {
-          /* page 6 覆盖为按键时长提示（替换正常 footer） */
-          SSD1306_DrawString(&oled, 0, 6, "S<0.8s  M<5s  L>5s");
-
           uint32_t dur = Button_PressDuration();
           uint8_t fill = (uint8_t)(dur * 126U / BTN_LONG_MS);
           if (fill > 126U) fill = 126U;
-          SSD1306_FillRect(&oled, 0,   56, 1,   8);   /* 左边 */
-          SSD1306_FillRect(&oled, 127, 56, 1,   8);   /* 右边 */
+          SSD1306_FillRect(&oled, 0,   56, 1,   8);   /* 左边框 */
+          SSD1306_FillRect(&oled, 127, 56, 1,   8);   /* 右边框 */
           SSD1306_FillRect(&oled, 1,   60, 126, 1);   /* 底边 */
           if (fill > 0U) SSD1306_FillRect(&oled, 1, 57, fill, 3);
-          SSD1306_FillRect(&oled, 20,  56, 1,   8);   /* 0.8s 临界 */
-          SSD1306_FillRect(&oled, 77,  56, 1,   8);   /* 3s 临界 */
           SSD1306_Update(&oled);
         }
 
