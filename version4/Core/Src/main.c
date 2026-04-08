@@ -409,14 +409,14 @@ static void UI_ShowFault(FaultType f)
 
 /* ===== 开机预热 ===== */
 
-#define WARMUP_SAMPLES      5
-#define WARMUP_INTERVAL_MS  150U
+#define WARMUP_SAMPLES      6
+#define WARMUP_INTERVAL_MS  500U
 
 static void UI_ShowWarmup(int step, int total)
 {
   SSD1306_Clear(&oled);
   SSD1306_DrawString(&oled, 16, 0, "BMS  v4.0");
-  SSD1306_DrawString(&oled, 8,  2, "Initializing");
+  SSD1306_DrawString(&oled, 4,  2, "Sensor warming");
 
   /* 进度条外框（像素坐标：y=33-38，x=4-123） */
   SSD1306_FillRect(&oled, 4,   33, 120, 1); /* 顶边 */
@@ -431,9 +431,6 @@ static void UI_ShowWarmup(int step, int total)
     if (fill_w > 0) SSD1306_FillRect(&oled, 5, 34, fill_w, 4);
   }
 
-  char wbuf[16];
-  snprintf(wbuf, sizeof(wbuf), "Step %d/%d", step, total);
-  SSD1306_DrawString(&oled, 28, 6, wbuf);
   SSD1306_Update(&oled);
 }
 
