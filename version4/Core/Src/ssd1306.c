@@ -72,3 +72,16 @@ void SSD1306_DrawString(SSD1306 *d, uint8_t x, uint8_t page, const char *s)
     if (x > (SSD1306_W - 6)) break;
   }
 }
+
+void SSD1306_FillRect(SSD1306 *d, uint8_t x, uint8_t y, uint8_t w, uint8_t h)
+{
+  for (uint8_t py = y; py < y + h; py++) {
+    uint8_t page = py / 8;
+    uint8_t bit  = py % 8;
+    if (page > 7) break;
+    for (uint8_t px = x; px < x + w; px++) {
+      if (px >= SSD1306_W) break;
+      d->buf[page * SSD1306_W + px] |= (uint8_t)(1u << bit);
+    }
+  }
+}

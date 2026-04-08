@@ -77,6 +77,7 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 
 /* SOC */
 static float soc = 0.90f;
+static uint8_t soc_inited = 0;
 #define SOC_LOW_THRESH     0.30f
 
 void SystemClock_Config(void);
@@ -87,12 +88,13 @@ static void MX_I2C3_Init(void);
 
 /* ===== INA228 helpers (按位宽读，避免尺度错误) ===== */
 
-/* 20-bit signed in [23:4] -> >>4 then sign-extend 20-bit */
+/* 20-bit signed in [23:4] -> >>4 then sign-extend 20-bit
+ * 返回 INT32_MIN 表示 I2C 通信失败（合法范围 ±(2^19)，远小于 INT32_MIN） */
 static int32_t INA228_ReadS20(uint8_t reg)
 {
   uint8_t buf[3] = {0};
   if (HAL_I2C_Mem_Read(&INA228_I2C, INA228_ADDR, reg, I2C_MEMADD_SIZE_8BIT, buf, 3, 100) != HAL_OK)
-    return 0;
+    return INT32_MIN;
 
   uint32_t raw24 = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
   int32_t v = (int32_t)(raw24 >> 4);
@@ -101,33 +103,38 @@ static int32_t INA228_ReadS20(uint8_t reg)
   return v;
 }
 
-/* 20-bit unsigned in [23:4] -> >>4 */
+/* 20-bit unsigned in [23:4] -> >>4
+ * 返回 UINT32_MAX 表示 I2C 通信失败（合法范围 0–0xFFFFF，远小于 UINT32_MAX） */
 static uint32_t INA228_ReadU20(uint8_t reg)
 {
   uint8_t buf[3] = {0};
   if (HAL_I2C_Mem_Read(&INA228_I2C, INA228_ADDR, reg, I2C_MEMADD_SIZE_8BIT, buf, 3, 100) != HAL_OK)
-    return 0;
+    return UINT32_MAX;
 
   uint32_t raw = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
   return (raw >> 4) & 0xFFFFFU;
 }
 
-static void INA228_Write16(uint8_t reg, uint16_t value)
+static HAL_StatusTypeDef INA228_Write16(uint8_t reg, uint16_t value)
 {
   uint8_t data[2];
   data[0] = (uint8_t)((value >> 8) & 0xFF);
   data[1] = (uint8_t)(value & 0xFF);
-  HAL_I2C_Mem_Write(&INA228_I2C, INA228_ADDR, reg, I2C_MEMADD_SIZE_8BIT, data, 2, 100);
+  return HAL_I2C_Mem_Write(&INA228_I2C, INA228_ADDR, reg, I2C_MEMADD_SIZE_8BIT, data, 2, 100);
 }
 
 static void INA228_Init_Simple(void)
 {
-  INA228_Write16(INA228_REG_CONFIG, INA228_CONFIG_RST);
+  if (INA228_Write16(INA228_REG_CONFIG, INA228_CONFIG_RST) != HAL_OK) {
+    Error_Handler();
+  }
   HAL_Delay(20);
 
   uint16_t cfg = 0;
   if (INA228_ADCRANGE_1) cfg |= INA228_CONFIG_ADCRANGE;
-  INA228_Write16(INA228_REG_CONFIG, cfg);
+  if (INA228_Write16(INA228_REG_CONFIG, cfg) != HAL_OK) {
+    Error_Handler();
+  }
 
   /* ADC_CONFIG (Address=0x01)
      AVG[2:0]  : 0=1,1=4,2=16,3=64,4=128,5=256,6=512,7=1024
@@ -142,12 +149,15 @@ static void INA228_Init_Simple(void)
   uint16_t vtct   = 5;
   uint16_t mode   = 0xB;
   uint16_t adc_conf = (uint16_t)((mode << 12) | (vbusct << 9) | (vshct << 6) | (vtct << 3) | (avg << 0));
-  INA228_Write16(INA228_REG_ADC_CONF, adc_conf);
+  if (INA228_Write16(INA228_REG_ADC_CONF, adc_conf) != HAL_OK) {
+    Error_Handler();
+  }
 }
 
 static float INA228_Vbus_V(void)
 {
   uint32_t v = INA228_ReadU20(INA228_REG_VBUS);
+  if (v == UINT32_MAX) return NAN;   /* I2C 失败：返回 NAN，调用方用 isnan() 检测 */
   return (float)v * VBUS_LSB_V;
 }
 
@@ -155,6 +165,7 @@ static float INA228_Vbus_V(void)
 static float INA228_Current_A(void)
 {
   int32_t vsh = INA228_ReadS20(INA228_REG_VSHUNT);
+  if (vsh == INT32_MIN) return NAN;  /* I2C 失败：返回 NAN，调用方用 isnan() 检测 */
   float lsb_V = INA228_ADCRANGE_1 ? 78.125e-9f : 312.5e-9f;
   float v_shunt_V = (float)vsh * lsb_V;
   return v_shunt_V / RSHUNT_OHM;
@@ -310,9 +321,13 @@ static void UI_ShowVolt(float v)
   char l2[24];
   UI_DrawHeader("VOLT");
 
-  int vi = (int)v;
-  int vd = (int)fabsf((v - (float)vi) * 1000.0f);
-  snprintf(l2, sizeof(l2), "%d.%03d V", vi, vd);
+  if (isnan(v)) {
+    strcpy(l2, "---.--- V");
+  } else {
+    int vi = (int)v;
+    int vd = (int)fabsf((v - (float)vi) * 1000.0f);
+    snprintf(l2, sizeof(l2), "%d.%03d V", vi, vd);
+  }
 
   SSD1306_DrawString(&oled, 0, 3, l2);
   UI_DrawFooter();
@@ -392,6 +407,63 @@ static void UI_ShowFault(FaultType f)
   SSD1306_Update(&oled);
 }
 
+/* ===== 开机预热 ===== */
+
+#define WARMUP_SAMPLES      5
+#define WARMUP_INTERVAL_MS  150U
+
+static void UI_ShowWarmup(int step, int total)
+{
+  SSD1306_Clear(&oled);
+  SSD1306_DrawString(&oled, 16, 0, "BMS  v4.0");
+  SSD1306_DrawString(&oled, 8,  2, "Initializing");
+
+  /* 进度条外框（像素坐标：y=33-38，x=4-123） */
+  SSD1306_FillRect(&oled, 4,   33, 120, 1); /* 顶边 */
+  SSD1306_FillRect(&oled, 4,   38, 120, 1); /* 底边 */
+  SSD1306_FillRect(&oled, 4,   33, 1,   6); /* 左边 */
+  SSD1306_FillRect(&oled, 123, 33, 1,   6); /* 右边 */
+
+  /* 进度填充（内部 118px 宽，4px 高） */
+  if (step > 0 && total > 0) {
+    uint8_t fill_w = (uint8_t)((uint32_t)step * 118u / (uint32_t)total);
+    if (fill_w > 118) fill_w = 118;
+    if (fill_w > 0) SSD1306_FillRect(&oled, 5, 34, fill_w, 4);
+  }
+
+  char wbuf[16];
+  snprintf(wbuf, sizeof(wbuf), "Step %d/%d", step, total);
+  SSD1306_DrawString(&oled, 28, 6, wbuf);
+  SSD1306_Update(&oled);
+}
+
+static void Warmup_Phase(void)
+{
+  float vbus_sum  = 0.0f;
+  int   valid_cnt = 0;
+
+  for (int step = 0; step <= WARMUP_SAMPLES; step++) {
+    UI_ShowWarmup(step, WARMUP_SAMPLES);
+    if (step == WARMUP_SAMPLES) break;
+
+    HAL_Delay(WARMUP_INTERVAL_MS);
+
+    float v = INA228_Vbus_V();
+    /* 3S LiPo 有效电压范围 8.4V（全空）~ 13.0V（满充上限） */
+    if (v >= 8.4f && v <= 13.0f) {
+      vbus_sum += v;
+      valid_cnt++;
+    }
+  }
+
+  if (valid_cnt > 0) {
+    float vcell = (vbus_sum / (float)valid_cnt) / 3.0f;
+    soc        = SOC_From_OCV_Cell(vcell);
+    soc_inited = 1;
+  }
+  /* valid_cnt==0：soc_inited 保持 0，主循环第一次采样时兜底 OCV 初始化 */
+}
+
 int main(void)
 {
   HAL_Init();
@@ -408,8 +480,8 @@ int main(void)
      用 GPIO 模式即可，因为你现在的翻页逻辑本来就是轮询 + 去抖，不需要中断。 */
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);
 
-  /* Default: MOSFET ON */
-  HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_SET);
+  /* 预热期间 MOSFET 保持断开，由主循环第一次采样后根据温度决定是否接通 */
+  HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_RESET);
 
   INA228_Init_Simple();
 
@@ -421,6 +493,8 @@ int main(void)
   if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE) {
     Error_Handler();
   }
+
+  Warmup_Phase();
 
   while (1)
   {
@@ -434,8 +508,6 @@ int main(void)
     static uint32_t last_sample = 0;
     static uint32_t last_draw = 0;
     static uint32_t bad_load_ms = 0;
-
-    static uint8_t soc_inited = 0;
 
     if (Button_Pressed_Event()) {
       if (fault == FAULT_NONE) {
@@ -453,68 +525,78 @@ int main(void)
       uint32_t dt = now - last_sample;
       last_sample = now;
 
-      vbus = INA228_Vbus_V();
-      float raw_ia = INA228_Current_A();
+      float new_vbus = INA228_Vbus_V();
+      float raw_ia   = INA228_Current_A();
 
-      static float filtered_ia = 0.0f;
-      static uint8_t ia_first_run = 1;
-
-      if (ia_first_run) {
-        filtered_ia = raw_ia;
-        ia_first_run = 0;
-      } else {
-        filtered_ia = 0.1f * raw_ia + 0.9f * filtered_ia;
-      }
-
-      /* deadband: <2mA 直接归零 */
-      if (fabsf(filtered_ia) < 0.002f) {
-        filtered_ia = 0.0f;
-      }
-
-      ia = filtered_ia;
-
+      /* NTC 采样不依赖 I2C，始终执行 */
       float vntc = ADC_Channel_Voltage(NTC_ADC_CH);
-      tC = (NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc) );
-      tte_sec = RT_UpdateAndCompute_TTE_sec(vbus, fabsf(ia), soc);
+      tC = NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc);
 
-      if (!soc_inited) {
-        float vcell = vbus / 3.0f;
-        soc = SOC_From_OCV_Cell(vcell);
-        soc_inited = 1;
-        /* 跳过本次库仑积分：dt = 开机到现在的时间，不代表采样间隔 */
-      } else {
-        /* Coulomb counting */
-        float Q_as = 2.2f * 3600.0f;
-        soc = soc - (fabsf(ia) * (dt / 1000.0f)) / Q_as;
-        soc = clampf(soc, 0.0f, 1.0f);
+      /* INA228 读取成功才更新电压/电流/SOC/过流故障 */
+      if (!isnan(new_vbus) && !isnan(raw_ia)) {
+        vbus = new_vbus;
 
-        /* Light OCV correction when current small */
-        if (fabsf(ia) < 0.05f) {
-          float vcell = vbus / 3.0f;
-          float soc_ocv = SOC_From_OCV_Cell(vcell);
-          soc = 0.98f * soc + 0.02f * soc_ocv;
-          soc = clampf(soc, 0.0f, 1.0f);
-        }
-      }
+        static float filtered_ia = 0.0f;
+        static uint8_t ia_first_run = 1;
 
-      if (fault == FAULT_NONE) {
-        if (!isnan(tC) && tC > TEMP_HI_C) {
-          fault = FAULT_WRONG_TEMP;
-        }
-
-        float absI = fabsf(ia);
-        uint8_t load_bad = 0;
-        if (absI > I_OVERCURRENT_A) load_bad = 1;
-        else if (absI < I_UNDERCURRENT_A) load_bad = 1;
-
-        if (load_bad) {
-          bad_load_ms += dt;
-          if (bad_load_ms >= LOAD_FAULT_MS) fault = FAULT_WRONG_LOAD;
+        if (ia_first_run) {
+          filtered_ia = raw_ia;
+          ia_first_run = 0;
         } else {
-          bad_load_ms = 0;
+          filtered_ia = 0.1f * raw_ia + 0.9f * filtered_ia;
+        }
+
+        /* deadband: <2mA 直接归零 */
+        if (fabsf(filtered_ia) < 0.002f) {
+          filtered_ia = 0.0f;
+        }
+
+        ia = filtered_ia;
+
+        tte_sec = RT_UpdateAndCompute_TTE_sec(vbus, fabsf(ia), soc);
+
+        if (!soc_inited) {
+          float vcell = vbus / 3.0f;
+          soc = SOC_From_OCV_Cell(vcell);
+          soc_inited = 1;
+          /* 跳过本次库仑积分：dt = 开机到现在的时间，不代表采样间隔 */
+        } else {
+          /* Coulomb counting */
+          float Q_as = CAPACITY_AH * 3600.0f;
+          soc = soc - (fabsf(ia) * (dt / 1000.0f)) / Q_as;
+          soc = clampf(soc, 0.0f, 1.0f);
+
+          /* Light OCV correction when current small */
+          if (fabsf(ia) < 0.05f) {
+            float vcell = vbus / 3.0f;
+            float soc_ocv = SOC_From_OCV_Cell(vcell);
+            soc = 0.98f * soc + 0.02f * soc_ocv;
+            soc = clampf(soc, 0.0f, 1.0f);
+          }
+        }
+
+        /* 过流/欠流故障检测（依赖 INA228） */
+        if (fault == FAULT_NONE) {
+          float absI = fabsf(ia);
+          uint8_t load_bad = 0;
+          if (absI > I_OVERCURRENT_A) load_bad = 1;
+          else if (absI < I_UNDERCURRENT_A) load_bad = 1;
+
+          if (load_bad) {
+            bad_load_ms += dt;
+            if (bad_load_ms >= LOAD_FAULT_MS) fault = FAULT_WRONG_LOAD;
+          } else {
+            bad_load_ms = 0;
+          }
         }
       }
 
+      /* 温度故障检测（不依赖 INA228，始终执行） */
+      if (fault == FAULT_NONE && !isnan(tC) && tC > TEMP_HI_C) {
+        fault = FAULT_WRONG_TEMP;
+      }
+
+      /* MOSFET 控制始终执行 */
       if (isnan(tC) || (tC > TEMP_MOSFET_OFF_C) || (fault != FAULT_NONE)) {
         HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_RESET);
       } else {

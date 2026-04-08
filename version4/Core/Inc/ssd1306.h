@@ -19,5 +19,6 @@ void SSD1306_Clear(SSD1306 *d);
 
 void SSD1306_DrawChar(SSD1306 *d, uint8_t x, uint8_t page, char c);
 void SSD1306_DrawString(SSD1306 *d, uint8_t x, uint8_t page, const char *s);
+void SSD1306_FillRect(SSD1306 *d, uint8_t x, uint8_t y, uint8_t w, uint8_t h);
 
 #endif
