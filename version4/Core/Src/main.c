@@ -310,15 +310,15 @@ static int       g_edit_idx           = -1;
 static float     g_edit_val           = 0.0f;
 static uint32_t  g_edit_last_activity = 0U;
 #define EDIT_TIMEOUT_MS  10000U
-#define EDIT_WARN_MS      8000U
 
-/* ===== Button (duration-aware) ===== */
-typedef enum { BTN_NONE = 0, BTN_SHORT, BTN_LONG } BtnEvent;
-#define BTN_SHORT_MS   500U
-#define BTN_LONG_MS   1500U
+/* ===== Button (multi-click) ===== */
+typedef enum { BTN_NONE = 0, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE } BtnEvent;
+#define BTN_CLICK_MAX_MS   500U    /* 单次点击最长按住时间 */
+#define MULTI_CLICK_MS     400U    /* 连击判定窗口 */
 static uint32_t g_btn_press_start  = 0U;
 static uint8_t  g_btn_pressing     = 0U;
-static uint8_t  g_btn_long_fired   = 0U;   /* 按住期间已触发长按 */
+static uint8_t  g_click_count      = 0U;
+static uint32_t g_last_release     = 0U;
 static BtnEvent g_btn_event        = BTN_NONE;
 
 /* ===== Transient hint ===== */
@@ -358,8 +358,8 @@ static void Button_Debounce_Sync(void)
 
 static void Button_Update(void)
 {
-  static uint8_t  candidate      = 0U;   /* 候选按下（等待消抖） */
-  static uint32_t candidate_tick = 0U;   /* 候选按下起始 tick    */
+  static uint8_t  candidate      = 0U;
+  static uint32_t candidate_tick = 0U;
 #define BTN_DEBOUNCE_MS  50U
 
   uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
@@ -368,44 +368,45 @@ static void Button_Update(void)
   if (g_btn_sync_needed) {
     g_btn_sync_needed = 0U;
     candidate         = 0U;
+    g_click_count     = 0U;
     g_btn_pressing    = (r == 0U) ? 1U : 0U;
     if (g_btn_pressing) g_btn_press_start = HAL_GetTick();
     return;
   }
 
   if (!g_btn_pressing) {
-    if (r == 0U) {                          /* GPIO 读到低电平 */
+    if (r == 0U) {
       if (!candidate) {
-        candidate      = 1U;               /* 第一次读到，记录时间 */
+        candidate      = 1U;
         candidate_tick = HAL_GetTick();
       } else if ((HAL_GetTick() - candidate_tick) >= BTN_DEBOUNCE_MS) {
-        /* 稳定 50 ms → 确认按下 */
         g_btn_pressing    = 1U;
-        g_btn_press_start = candidate_tick; /* 从候选时刻开始计时 */
-        g_btn_long_fired  = 0U;
+        g_btn_press_start = candidate_tick;
         candidate         = 0U;
       }
     } else {
-      candidate = 0U;                      /* 高电平：消除候选（噪声） */
+      candidate = 0U;
     }
   } else {
-    /* 按住期间：到达 1.5s 立即触发长按（不等松手） */
-    if (!g_btn_long_fired &&
-        (HAL_GetTick() - g_btn_press_start) >= BTN_LONG_MS) {
-      g_btn_event      = BTN_LONG;
-      g_btn_long_fired = 1U;
-    }
-    if (r != 0U) {                          /* 检测到松手 */
+    if (r != 0U) {                          /* 松手 */
       uint32_t dur = HAL_GetTick() - g_btn_press_start;
       g_btn_pressing = 0U;
       candidate      = 0U;
-      if (g_btn_long_fired) {
-        g_btn_long_fired = 0U;              /* 长按已触发，松手不产生事件 */
-      } else if (dur < BTN_SHORT_MS) {
-        g_btn_event = BTN_SHORT;
+      if (dur < BTN_CLICK_MAX_MS) {         /* 有效点击 */
+        g_click_count++;
+        g_last_release = HAL_GetTick();
       }
-      /* 500ms <= dur < 1500ms 松手：死区，不产生事件 */
+      /* 按住超过 500ms 的不算点击，忽略 */
     }
+  }
+
+  /* 连击窗口到期 → 产生事件 */
+  if (g_click_count > 0U &&
+      (HAL_GetTick() - g_last_release) >= MULTI_CLICK_MS) {
+    if (g_click_count == 1U)      g_btn_event = BTN_SINGLE;
+    else if (g_click_count == 2U) g_btn_event = BTN_DOUBLE;
+    else                          g_btn_event = BTN_TRIPLE;
+    g_click_count = 0U;
   }
 }
 
@@ -414,11 +415,6 @@ static BtnEvent Button_ConsumeEvent(void)
   BtnEvent e  = g_btn_event;
   g_btn_event = BTN_NONE;
   return e;
-}
-
-static uint32_t Button_PressDuration(void)
-{
-  return g_btn_pressing ? (HAL_GetTick() - g_btn_press_start) : 0U;
 }
 
 /* ===== UI ===== */
@@ -495,11 +491,7 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low,
     int ev = (int)(edit_val * 100.0f + 0.5f);
     snprintf(txt, sizeof(txt), "[%d%%]", ev);
     SSD1306_DrawString(&oled, 0, 4, txt);
-    uint32_t idle = HAL_GetTick() - g_edit_last_activity;
-    if (idle >= EDIT_WARN_MS && ((idle / 300U) % 2U))
-      SSD1306_DrawString(&oled, 0, 6, "DISCARD?");
-    else
-      SSD1306_DrawString(&oled, 0, 6, "S:+5  L:save");
+    SSD1306_DrawString(&oled, 0, 6, "3x:+5 2x:save");
   } else {
     if (soc_low)
       SSD1306_DrawString(&oled, 92, 4, "LOW");
@@ -535,11 +527,7 @@ static void UI_ShowTemp(float tC, uint8_t edit_mode, float edit_val)
     int ei = (int)edit_val;
     snprintf(l2, sizeof(l2), "[%d C]", ei);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    uint32_t idle = HAL_GetTick() - g_edit_last_activity;
-    if (idle >= EDIT_WARN_MS && ((idle / 300U) % 2U))
-      SSD1306_DrawString(&oled, 0, 6, "DISCARD?");
-    else
-      SSD1306_DrawString(&oled, 0, 6, "S:+5  L:save");
+    SSD1306_DrawString(&oled, 0, 6, "3x:+5 2x:save");
   } else {
     /* 正常：显示当前生效阈值 */
     int gi = (int)g_mosfet_off_temp;
@@ -584,11 +572,7 @@ static void UI_ShowCurr(float ia, uint8_t edit_mode, float edit_val)
     int ev = (int)(edit_val * 1000.0f + 0.5f);
     snprintf(l2, sizeof(l2), "[%d mA]", ev);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    uint32_t idle = HAL_GetTick() - g_edit_last_activity;
-    if (idle >= EDIT_WARN_MS && ((idle / 300U) % 2U))
-      SSD1306_DrawString(&oled, 0, 6, "DISCARD?");
-    else
-      SSD1306_DrawString(&oled, 0, 6, "S:+50 L:save");
+    SSD1306_DrawString(&oled, 0, 6, "3x:+50 2x:save");
   } else {
     { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   }
@@ -851,12 +835,12 @@ int main(void)
     uint32_t now = HAL_GetTick();
 
     if (g_mode == MODE_NORMAL) {
-      if (ev == BTN_SHORT && fault == FAULT_NONE) {
-        /* 短按（<0.5s）：翻页 */
+      if (ev == BTN_SINGLE && fault == FAULT_NONE) {
+        /* 单击：翻页 */
         page = (page == UI_TIME) ? UI_SOC : (UiPage)(page + 1);
         Hint_Set("Next Page");
-      } else if (ev == BTN_LONG && fault == FAULT_NONE) {
-        /* 长按（>=1.5s，按住触发）：在可编辑页进入设置模式 */
+      } else if (ev == BTN_DOUBLE && fault == FAULT_NONE) {
+        /* 双击：在可编辑页进入设置模式 */
         int idx = EditParam_FindByPage(page);
         if (idx >= 0) {
           g_edit_idx           = idx;
@@ -871,15 +855,15 @@ int main(void)
       if (fault != FAULT_NONE) {
         g_mode = MODE_NORMAL;
         Hint_Set("FAULT");
-      } else if (ev == BTN_SHORT) {
-        /* 短按：循环递增 */
+      } else if (ev == BTN_TRIPLE) {
+        /* 三连击：循环递增 */
         const EditParamDef *def = &g_edit_params[g_edit_idx];
         g_edit_val += def->step;
         if (g_edit_val > def->max_val + def->step * 0.1f)
           g_edit_val = def->min_val;
         g_edit_last_activity = now;
-      } else if (ev == BTN_LONG) {
-        /* 长按：保存并退出 */
+      } else if (ev == BTN_DOUBLE) {
+        /* 双击：保存并退出 */
         const EditParamDef *def = &g_edit_params[g_edit_idx];
         *def->p_runtime = g_edit_val;
         if (Flash_SaveSettings())
@@ -888,7 +872,7 @@ int main(void)
           Hint_Set("ERR:Flash");
         g_mode = MODE_NORMAL;
       }
-      /* 超时检查：最后 2s 闪烁警告，10s 放弃 */
+      /* 超时检查 */
       if (g_mode == MODE_EDIT && (now - g_edit_last_activity >= EDIT_TIMEOUT_MS)) {
         g_mode = MODE_NORMAL;
         Hint_Set("Cancelled");
@@ -1005,17 +989,6 @@ int main(void)
         else if (page == UI_CURR)      UI_ShowCurr(ia, in_edit, g_edit_val);
         else                           UI_ShowTime(tte_sec);
 
-        /* 按压期间底部叠加进度条（进满 1.5s 即触发长按） */
-        if (g_btn_pressing) {
-          uint32_t dur = Button_PressDuration();
-          uint8_t fill = (uint8_t)(dur * 126U / BTN_LONG_MS);
-          if (fill > 126U) fill = 126U;
-          SSD1306_FillRect(&oled, 0,   56, 1,   8);   /* 左边框 */
-          SSD1306_FillRect(&oled, 127, 56, 1,   8);   /* 右边框 */
-          SSD1306_FillRect(&oled, 1,   60, 126, 1);   /* 底边 */
-          if (fill > 0U) SSD1306_FillRect(&oled, 1, 57, fill, 3);
-          SSD1306_Update(&oled);
-        }
 
         if (soc_low) {
           SSD1306_DrawString(&oled, 0, 5, "SOC TOO LOW");
