@@ -309,25 +309,40 @@ static void Button_Debounce_Sync(void)
 
 static void Button_Update(void)
 {
+  static uint8_t  candidate      = 0U;   /* 候选按下（等待消抖） */
+  static uint32_t candidate_tick = 0U;   /* 候选按下起始 tick    */
+#define BTN_DEBOUNCE_MS  50U
+
   uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
 
   /* 复用 warmup 同步标志 */
   if (g_btn_sync_needed) {
     g_btn_sync_needed = 0U;
+    candidate         = 0U;
     g_btn_pressing    = (r == 0U) ? 1U : 0U;
     if (g_btn_pressing) g_btn_press_start = HAL_GetTick();
     return;
   }
 
   if (!g_btn_pressing) {
-    if (r == 0U) {                          /* 检测到按下 */
-      g_btn_pressing    = 1U;
-      g_btn_press_start = HAL_GetTick();
+    if (r == 0U) {                          /* GPIO 读到低电平 */
+      if (!candidate) {
+        candidate      = 1U;               /* 第一次读到，记录时间 */
+        candidate_tick = HAL_GetTick();
+      } else if ((HAL_GetTick() - candidate_tick) >= BTN_DEBOUNCE_MS) {
+        /* 稳定 50 ms → 确认按下 */
+        g_btn_pressing    = 1U;
+        g_btn_press_start = candidate_tick; /* 从候选时刻开始计时 */
+        candidate         = 0U;
+      }
+    } else {
+      candidate = 0U;                      /* 高电平：消除候选（噪声） */
     }
   } else {
     if (r != 0U) {                          /* 检测到松手 */
       uint32_t dur = HAL_GetTick() - g_btn_press_start;
       g_btn_pressing = 0U;
+      candidate      = 0U;
       if      (dur < BTN_SHORT_MS) g_btn_event = BTN_SHORT;
       else if (dur < BTN_LONG_MS)  g_btn_event = BTN_MEDIUM;
       else                         g_btn_event = BTN_LONG;
@@ -859,6 +874,9 @@ int main(void)
         /* 按压期间在底部叠加进度条（SSD1306_Update 已在各 Show 函数中调用，
            进度条需要在之后单独叠加再刷新） */
         if (g_btn_pressing) {
+          /* page 6 覆盖为按键时长提示（替换正常 footer） */
+          SSD1306_DrawString(&oled, 0, 6, "S<0.8s  M<5s  L>5s");
+
           uint32_t dur = Button_PressDuration();
           uint8_t fill = (uint8_t)(dur * 126U / BTN_LONG_MS);
           if (fill > 126U) fill = 126U;
