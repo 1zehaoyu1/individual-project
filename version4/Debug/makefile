@@ -61,8 +61,8 @@ all: main-build
 main-build: NUCLEO_G491RE_Test.elf secondary-outputs
 
 # Tool invocations
-NUCLEO_G491RE_Test.elf NUCLEO_G491RE_Test.map: $(OBJS) $(USER_OBJS) /Users/yu/Documents/NUCLEO_G491RE_Test/STM32G491RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "NUCLEO_G491RE_Test.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/Users/yu/Documents/NUCLEO_G491RE_Test/STM32G491RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="NUCLEO_G491RE_Test.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+NUCLEO_G491RE_Test.elf NUCLEO_G491RE_Test.map: $(OBJS) $(USER_OBJS) /Users/yu/Desktop/BMS/version4/STM32G491RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "NUCLEO_G491RE_Test.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/Users/yu/Desktop/BMS/version4/STM32G491RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="NUCLEO_G491RE_Test.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

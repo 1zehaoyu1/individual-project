@@ -68,8 +68,12 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 #define MOSFET_OFF_TEMP_STEP      5.0f
 static float g_mosfet_off_temp = DEFAULT_MOSFET_OFF_TEMP;
 
-/* 过流 / 欠流阈值：400mA / 6mA */
-#define I_OVERCURRENT_A      0.4f
+/* 过流 / 欠流阈值 */
+#define DEFAULT_OVERCURRENT_A  0.4f
+#define OVERCURRENT_A_MIN      0.1f
+#define OVERCURRENT_A_MAX      0.8f
+#define OVERCURRENT_A_STEP     0.05f
+static float g_overcurrent_a = DEFAULT_OVERCURRENT_A;
 #define I_UNDERCURRENT_A     0.006f
 #define LOAD_FAULT_MS        10000U
 #define CAPACITY_AH      2.2f
@@ -82,7 +86,11 @@ static float g_mosfet_off_temp = DEFAULT_MOSFET_OFF_TEMP;
 /* SOC */
 static float soc = 0.90f;
 static uint8_t soc_inited = 0;
-#define SOC_LOW_THRESH     0.30f
+#define DEFAULT_SOC_LOW_THRESH  0.30f
+#define SOC_LOW_MIN             0.05f
+#define SOC_LOW_MAX             0.50f
+#define SOC_LOW_STEP            0.05f
+static float g_soc_low_thresh = DEFAULT_SOC_LOW_THRESH;
 
 /* F5 SOC 历史采样 */
 #define SOC_HIST_N            64U
@@ -272,20 +280,46 @@ static float SOC_From_OCV_Cell(float v_cell)
   return 0.5f;
 }
 
+/* ===== 可编辑参数描述表 (F2) ===== */
+typedef struct {
+    UiPage      page;
+    float       def_val, min_val, max_val, step;
+    float      *p_runtime;
+    const char *unit;       /* 显示单位 */
+    uint8_t     is_int;     /* 1=整数显示 0=需换算 */
+} EditParamDef;
+
+#define EDIT_PARAM_COUNT 3
+static const EditParamDef g_edit_params[EDIT_PARAM_COUNT] = {
+    { UI_TEMP, 30.0f,  15.0f, 50.0f, 5.0f,   &g_mosfet_off_temp, "C",  1 },
+    { UI_CURR,  0.4f,   0.1f,  0.8f, 0.05f,  &g_overcurrent_a,   "mA", 0 },
+    { UI_SOC,   0.30f,  0.05f, 0.50f, 0.05f, &g_soc_low_thresh,  "%",  0 },
+};
+
+static int EditParam_FindByPage(UiPage pg)
+{
+  for (int i = 0; i < EDIT_PARAM_COUNT; i++)
+    if (g_edit_params[i].page == pg) return i;
+  return -1;
+}
+
 /* ===== App mode ===== */
-typedef enum { MODE_NORMAL = 0, MODE_EDIT_TEMP } AppMode;
-static AppMode   g_mode            = MODE_NORMAL;
-static float     g_edit_val        = 0.0f;
-static uint32_t  g_edit_enter_tick = 0U;
-#define EDIT_TIMEOUT_MS  8000U
+typedef enum { MODE_NORMAL = 0, MODE_EDIT } AppMode;
+static AppMode   g_mode               = MODE_NORMAL;
+static int       g_edit_idx           = -1;
+static float     g_edit_val           = 0.0f;
+static uint32_t  g_edit_last_activity = 0U;
+#define EDIT_TIMEOUT_MS  10000U
+#define EDIT_WARN_MS      8000U
 
 /* ===== Button (duration-aware) ===== */
 typedef enum { BTN_NONE = 0, BTN_SHORT, BTN_LONG } BtnEvent;
 #define BTN_SHORT_MS   500U
-#define BTN_LONG_MS   5000U
-static uint32_t g_btn_press_start = 0U;
-static uint8_t  g_btn_pressing    = 0U;
-static BtnEvent g_btn_event       = BTN_NONE;
+#define BTN_LONG_MS   1500U
+static uint32_t g_btn_press_start  = 0U;
+static uint8_t  g_btn_pressing     = 0U;
+static uint8_t  g_btn_long_fired   = 0U;   /* 按住期间已触发长按 */
+static BtnEvent g_btn_event        = BTN_NONE;
 
 /* ===== Transient hint ===== */
 static char     g_hint_text[24]  = {0};
@@ -348,18 +382,29 @@ static void Button_Update(void)
         /* 稳定 50 ms → 确认按下 */
         g_btn_pressing    = 1U;
         g_btn_press_start = candidate_tick; /* 从候选时刻开始计时 */
+        g_btn_long_fired  = 0U;
         candidate         = 0U;
       }
     } else {
       candidate = 0U;                      /* 高电平：消除候选（噪声） */
     }
   } else {
+    /* 按住期间：到达 1.5s 立即触发长按（不等松手） */
+    if (!g_btn_long_fired &&
+        (HAL_GetTick() - g_btn_press_start) >= BTN_LONG_MS) {
+      g_btn_event      = BTN_LONG;
+      g_btn_long_fired = 1U;
+    }
     if (r != 0U) {                          /* 检测到松手 */
       uint32_t dur = HAL_GetTick() - g_btn_press_start;
       g_btn_pressing = 0U;
       candidate      = 0U;
-      if (dur < BTN_SHORT_MS) g_btn_event = BTN_SHORT;
-      else                    g_btn_event = BTN_LONG;
+      if (g_btn_long_fired) {
+        g_btn_long_fired = 0U;              /* 长按已触发，松手不产生事件 */
+      } else if (dur < BTN_SHORT_MS) {
+        g_btn_event = BTN_SHORT;
+      }
+      /* 500ms <= dur < 1500ms 松手：死区，不产生事件 */
     }
   }
 }
@@ -411,9 +456,10 @@ static void UI_DrawSOCCurve(void)
   }
 }
 
-static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
+static void UI_ShowSOC(int soc_percent, uint8_t soc_low,
+                       uint8_t edit_mode, float edit_val)
 {
-  char txt[8];
+  char txt[24];
   if (soc_percent < 0)   soc_percent = 0;
   if (soc_percent > 100) soc_percent = 100;
 
@@ -430,29 +476,35 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
   /* 正极突起：居中偏移 (BAT_H-BAT_NUB_H)/2 = 2 → y18-20 */
   SSD1306_FillRect(&oled, BAT_X+BAT_W, BAT_Y+2, BAT_NUB_W, BAT_NUB_H);
 
-  /* 内部填充（低电量时按 blink_phase 闪烁隐藏，翻转在渲染后以确保首帧可见）
-   * 内部可用宽：BAT_W - 左边框(1) - 左内边距(1) - 右内边距(1) - 右边框(1) = 82
-   * 内部可用高：BAT_H - 上边框(1) - 上内边距(1) - 下内边距(1) - 下边框(1) = 3 → BAT_H-4 */
+  /* 内部填充（低电量时按 blink_phase 闪烁隐藏，翻转在渲染后以确保首帧可见） */
   if (!(soc_low && blink_phase)) {
     uint8_t fill_w = (uint8_t)((uint32_t)soc_percent * 82u / 100u);
     if (fill_w > 82u) fill_w = 82u;
     if (fill_w > 0u)
       SSD1306_FillRect(&oled, BAT_X+2, BAT_Y+2, fill_w, BAT_H-4);
   }
-  /* 翻转放在渲染后：保证低电量首帧填充条可见 */
   if (soc_low) blink_phase ^= 1u;
   else         blink_phase  = 0u;
 
-  /* page 2: 百分比文字，与图标同行（x=92 在图标右侧，DrawString 第三参数为 page 编号） */
+  /* page 2: 百分比文字 */
   snprintf(txt, sizeof(txt), "%d%%", soc_percent);
   SSD1306_DrawString(&oled, 92, 2, txt);
 
-  /* page 4: 低电量警告（仅 soc_low 时显示，有足够空白） */
-  if (soc_low)
-    SSD1306_DrawString(&oled, 92, 4, "LOW");
-
-  /* page 6: 短暂提示（按键后 1.5s） */
-  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
+  if (edit_mode) {
+    /* 编辑中：显示低电量阈值 */
+    int ev = (int)(edit_val * 100.0f + 0.5f);
+    snprintf(txt, sizeof(txt), "[%d%%]", ev);
+    SSD1306_DrawString(&oled, 0, 4, txt);
+    uint32_t idle = HAL_GetTick() - g_edit_last_activity;
+    if (idle >= EDIT_WARN_MS && ((idle / 300U) % 2U))
+      SSD1306_DrawString(&oled, 0, 6, "DISCARD?");
+    else
+      SSD1306_DrawString(&oled, 0, 6, "S:+5  L:save");
+  } else {
+    if (soc_low)
+      SSD1306_DrawString(&oled, 92, 4, "LOW");
+    { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
+  }
   SSD1306_Update(&oled);
 }
 
@@ -483,7 +535,11 @@ static void UI_ShowTemp(float tC, uint8_t edit_mode, float edit_val)
     int ei = (int)edit_val;
     snprintf(l2, sizeof(l2), "[%d C]", ei);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    SSD1306_DrawString(&oled, 0, 6, "S:+  L:save");
+    uint32_t idle = HAL_GetTick() - g_edit_last_activity;
+    if (idle >= EDIT_WARN_MS && ((idle / 300U) % 2U))
+      SSD1306_DrawString(&oled, 0, 6, "DISCARD?");
+    else
+      SSD1306_DrawString(&oled, 0, 6, "S:+5  L:save");
   } else {
     /* 正常：显示当前生效阈值 */
     int gi = (int)g_mosfet_off_temp;
@@ -512,7 +568,7 @@ static void UI_ShowVolt(float v)
   SSD1306_Update(&oled);
 }
 
-static void UI_ShowCurr(float ia)
+static void UI_ShowCurr(float ia, uint8_t edit_mode, float edit_val)
 {
   char l2[24];
   UI_DrawHeader("CURR");
@@ -521,9 +577,21 @@ static void UI_ShowCurr(float ia)
   int mi = (int)mA;
   int md = (int)fabsf((mA - (float)mi) * 10.0f);
   snprintf(l2, sizeof(l2), "%d.%d mA", mi, md);
+  SSD1306_DrawString(&oled, 0, 2, l2);
 
-  SSD1306_DrawString(&oled, 0, 3, l2);
-  { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
+  if (edit_mode) {
+    /* 编辑中：显示过流阈值（A → mA） */
+    int ev = (int)(edit_val * 1000.0f + 0.5f);
+    snprintf(l2, sizeof(l2), "[%d mA]", ev);
+    SSD1306_DrawString(&oled, 0, 4, l2);
+    uint32_t idle = HAL_GetTick() - g_edit_last_activity;
+    if (idle >= EDIT_WARN_MS && ((idle / 300U) % 2U))
+      SSD1306_DrawString(&oled, 0, 6, "DISCARD?");
+    else
+      SSD1306_DrawString(&oled, 0, 6, "S:+50 L:save");
+  } else {
+    { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
+  }
   SSD1306_Update(&oled);
 }
 
@@ -612,44 +680,89 @@ static void UI_ShowWarmup(int step, int total)
   SSD1306_Update(&oled);
 }
 
-/* ===== Flash 设置存储 ===== */
+/* ===== Flash 设置存储（F2：3 个阈值 + checksum） ===== */
 #define SETTINGS_FLASH_ADDR  0x0807F800UL
 #define SETTINGS_MAGIC       0xBEEFCAFEUL
+
+/*  Flash 布局（3 doubleword = 24 字节）：
+ *  DW0 (0x00): [31:0] magic        [63:32] mosfet_off_temp
+ *  DW1 (0x08): [31:0] overcurrent  [63:32] soc_low_thresh
+ *  DW2 (0x10): [31:0] checksum     [63:32] 0xFFFFFFFF  */
+
+static uint32_t Settings_Checksum(const uint32_t *data, uint32_t count)
+{
+  uint32_t sum = 0U;
+  for (uint32_t i = 0; i < count; i++) sum += data[i];
+  return sum;
+}
 
 static void Flash_LoadSettings(void)
 {
   const uint32_t *p = (const uint32_t *)SETTINGS_FLASH_ADDR;
-  uint32_t magic, raw;
-  memcpy(&magic, p,     4);
-  memcpy(&raw,   p + 1, 4);
-  if (magic != SETTINGS_MAGIC) return;    /* 首次上电，保留默认值 */
+  uint32_t words[5];  /* magic, temp, curr, soc, checksum */
+  memcpy(words, p, sizeof(words));
+
+  if (words[0] != SETTINGS_MAGIC) return; /* 首次上电 */
+  if (words[4] != Settings_Checksum(words, 4)) return; /* 校验失败 */
+
   float val;
-  memcpy(&val, &raw, 4);
+  memcpy(&val, &words[1], 4);
   if (val >= MOSFET_OFF_TEMP_MIN && val <= MOSFET_OFF_TEMP_MAX)
     g_mosfet_off_temp = val;
+
+  memcpy(&val, &words[2], 4);
+  if (val >= OVERCURRENT_A_MIN && val <= OVERCURRENT_A_MAX)
+    g_overcurrent_a = val;
+
+  memcpy(&val, &words[3], 4);
+  if (val >= SOC_LOW_MIN && val <= SOC_LOW_MAX)
+    g_soc_low_thresh = val;
 }
 
-static void Flash_SaveSettings(void)
+static uint8_t Flash_SaveSettings(void)
 {
-  HAL_FLASH_Unlock();
+  if (HAL_FLASH_Unlock() != HAL_OK) return 0U;
 
   FLASH_EraseInitTypeDef er = {
     .TypeErase = FLASH_TYPEERASE_PAGES,
     .Banks     = FLASH_BANK_1,
-    .Page      = 255U,    /* 末尾页：0x0807F800，2KB */
+    .Page      = 255U,
     .NbPages   = 1U
   };
   uint32_t page_err = 0U;
-  HAL_FLASHEx_Erase(&er, &page_err);
+  if (HAL_FLASHEx_Erase(&er, &page_err) != HAL_OK || page_err != 0xFFFFFFFFU) {
+    HAL_FLASH_Lock();
+    return 0U;
+  }
 
-  /* 第一个 doubleword：magic + g_mosfet_off_temp */
+  /* 组装数据 */
   uint32_t raw_magic = SETTINGS_MAGIC;
-  uint32_t raw_val;
-  memcpy(&raw_val, &g_mosfet_off_temp, 4);
-  uint64_t dw = (uint64_t)raw_magic | ((uint64_t)raw_val << 32);
-  HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SETTINGS_FLASH_ADDR, dw);
+  uint32_t raw_temp, raw_curr, raw_soc;
+  memcpy(&raw_temp, &g_mosfet_off_temp, 4);
+  memcpy(&raw_curr, &g_overcurrent_a,   4);
+  memcpy(&raw_soc,  &g_soc_low_thresh,  4);
+
+  uint32_t ck_data[4] = { raw_magic, raw_temp, raw_curr, raw_soc };
+  uint32_t cksum = Settings_Checksum(ck_data, 4);
+
+  /* DW0: magic + temp */
+  uint64_t dw0 = (uint64_t)raw_magic | ((uint64_t)raw_temp << 32);
+  if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SETTINGS_FLASH_ADDR, dw0) != HAL_OK) {
+    HAL_FLASH_Lock(); return 0U;
+  }
+  /* DW1: curr + soc */
+  uint64_t dw1 = (uint64_t)raw_curr | ((uint64_t)raw_soc << 32);
+  if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SETTINGS_FLASH_ADDR + 8U, dw1) != HAL_OK) {
+    HAL_FLASH_Lock(); return 0U;
+  }
+  /* DW2: checksum + padding */
+  uint64_t dw2 = (uint64_t)cksum | ((uint64_t)0xFFFFFFFFU << 32);
+  if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, SETTINGS_FLASH_ADDR + 16U, dw2) != HAL_OK) {
+    HAL_FLASH_Lock(); return 0U;
+  }
 
   HAL_FLASH_Lock();
+  return 1U;
 }
 
 static void Warmup_Phase(void)
@@ -743,28 +856,42 @@ int main(void)
         page = (page == UI_TIME) ? UI_SOC : (UiPage)(page + 1);
         Hint_Set("Next Page");
       } else if (ev == BTN_LONG && fault == FAULT_NONE) {
-        /* 长按（>=5s）：进入设置模式，切至 TEMP 页 */
-        page              = UI_TEMP;
-        g_mode            = MODE_EDIT_TEMP;
-        g_edit_val        = g_mosfet_off_temp;
-        g_edit_enter_tick = now;
-        Hint_Set("Setting Mode");
+        /* 长按（>=1.5s，按住触发）：在可编辑页进入设置模式 */
+        int idx = EditParam_FindByPage(page);
+        if (idx >= 0) {
+          g_edit_idx           = idx;
+          g_edit_val           = *g_edit_params[idx].p_runtime;
+          g_edit_last_activity = now;
+          g_mode               = MODE_EDIT;
+          Hint_Set("EDIT");
+        }
       }
-    } else {  /* MODE_EDIT_TEMP */
-      if (ev == BTN_SHORT) {
-        /* 短按：循环递增温度阈值 */
-        g_edit_val += MOSFET_OFF_TEMP_STEP;
-        if (g_edit_val > MOSFET_OFF_TEMP_MAX) g_edit_val = MOSFET_OFF_TEMP_MIN;
-        g_edit_enter_tick = now;
+    } else {  /* MODE_EDIT */
+      /* 故障发生时立即退出编辑，不保存 */
+      if (fault != FAULT_NONE) {
+        g_mode = MODE_NORMAL;
+        Hint_Set("FAULT");
+      } else if (ev == BTN_SHORT) {
+        /* 短按：循环递增 */
+        const EditParamDef *def = &g_edit_params[g_edit_idx];
+        g_edit_val += def->step;
+        if (g_edit_val > def->max_val + def->step * 0.1f)
+          g_edit_val = def->min_val;
+        g_edit_last_activity = now;
       } else if (ev == BTN_LONG) {
         /* 长按：保存并退出 */
-        g_mosfet_off_temp = g_edit_val;
-        Flash_SaveSettings();
+        const EditParamDef *def = &g_edit_params[g_edit_idx];
+        *def->p_runtime = g_edit_val;
+        if (Flash_SaveSettings())
+          Hint_Set("Saved");
+        else
+          Hint_Set("ERR:Flash");
         g_mode = MODE_NORMAL;
-        Hint_Set("Saved");
       }
-      if (now - g_edit_enter_tick >= EDIT_TIMEOUT_MS) {
-        g_mode = MODE_NORMAL;               /* 超时放弃，不保存 */
+      /* 超时检查：最后 2s 闪烁警告，10s 放弃 */
+      if (g_mode == MODE_EDIT && (now - g_edit_last_activity >= EDIT_TIMEOUT_MS)) {
+        g_mode = MODE_NORMAL;
+        Hint_Set("Cancelled");
       }
     }
 
@@ -836,7 +963,7 @@ int main(void)
         if (fault == FAULT_NONE) {
           float absI = fabsf(ia);
           uint8_t load_bad = 0;
-          if (absI > I_OVERCURRENT_A) load_bad = 1;
+          if (absI > g_overcurrent_a) load_bad = 1;
           else if (absI < I_UNDERCURRENT_A) load_bad = 1;
 
           if (load_bad) {
@@ -868,17 +995,17 @@ int main(void)
         UI_ShowFault(fault);
       } else {
         int soc_percent = (int)(soc * 100.0f + 0.5f);
-        uint8_t soc_low = (soc < SOC_LOW_THRESH) ? 1 : 0;
+        uint8_t soc_low = (soc < g_soc_low_thresh) ? 1 : 0;
 
-        uint8_t in_edit = (g_mode == MODE_EDIT_TEMP);
-        if (page == UI_SOC)            UI_ShowSOC(soc_percent, soc_low);
+        uint8_t in_edit = (g_mode == MODE_EDIT);
+        if (page == UI_SOC)            UI_ShowSOC(soc_percent, soc_low, in_edit, g_edit_val);
         else if (page == UI_SOC_CURVE) UI_ShowSOCCurvePage();
         else if (page == UI_TEMP)      UI_ShowTemp(tC, in_edit, g_edit_val);
         else if (page == UI_VOLT)      UI_ShowVolt(vbus);
-        else if (page == UI_CURR)      UI_ShowCurr(ia);
+        else if (page == UI_CURR)      UI_ShowCurr(ia, in_edit, g_edit_val);
         else                           UI_ShowTime(tte_sec);
 
-        /* 按压期间底部叠加进度条（进满 5s 即触发长按） */
+        /* 按压期间底部叠加进度条（进满 1.5s 即触发长按） */
         if (g_btn_pressing) {
           uint32_t dur = Button_PressDuration();
           uint8_t fill = (uint8_t)(dur * 126U / BTN_LONG_MS);
