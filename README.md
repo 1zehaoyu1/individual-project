@@ -30,6 +30,8 @@
 | v1 | [version1/](./version1/) | 基础采集与显示（INA228、NTC、OLED） |
 | v2 | [version2/](./version2/) | 故障检测优化 + Nucleo BSP |
 | v3 | [version3/](./version3/) | 库仑计数SOC + 剩余时间估算 |
-| v4（当前）| [version4/](./version4/) | 完整项目（所有文件，可直接编译） |
+| v4 | [version4/](./version4/) | 完整工程基线（F1 预热 + F5 SOC 可视化，可编译） |
+| v5（当前）| [version5/](./version5/) | + F2 设置模式、状态机架构、按键修复、防呆阈值 |
 
-每个版本文件夹内都有 `README.md` 说明该版本的改动内容，以及对应的 `main.c` 源代码。
+- version1–3：`main.c` 快照 + README
+- version4–5：完整可编译工程（Core/、Drivers/、Debug/）

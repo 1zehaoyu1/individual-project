@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-It serves as the project-level entry point. For version-specific implementation details, see `version4/CLAUDE.md`.
+It serves as the project-level entry point. For version-specific implementation details, see `version5/CLAUDE.md`.
 
 ---
 
@@ -22,7 +22,8 @@ individual-project/
 ├── version1/           # v1 代码快照（main.c + 说明）
 ├── version2/           # v2 代码快照
 ├── version3/           # v3 代码快照
-└── version4/           # 当前完整工程（可编译）
+├── version4/           # v4 完整工程基线（F1 预热 + F5 SOC 可视化，不含 F2）
+└── version5/           # v5 当前完整工程（+ F2 设置模式、状态机架构）
     ├── Core/Src/       # 应用逻辑（main.c、ssd1306.c、font5x7.c 等）
     ├── Core/Inc/       # 头文件
     ├── Drivers/        # ST HAL / CMSIS / BSP 库
@@ -34,13 +35,13 @@ individual-project/
 
 ```bash
 # 编译（需安装 arm-none-eabi-gcc）
-cd version4/Debug && make
+cd version5/Debug && make
 
 # 清理重编
-cd version4/Debug && make clean
+cd version5/Debug && make clean
 ```
 
-输出文件：`version4/Debug/NUCLEO_G491RE_Test.elf`
+输出文件：`version5/Debug/NUCLEO_G491RE_Test.elf`
 烧录方式：STM32CubeIDE 或 ST-LINK（不通过 make 烧录）
 
 ## 硬件外设一览
@@ -54,7 +55,7 @@ cd version4/Debug && make clean
 | 用户按钮 B1 | GPIO | 翻页，50 ms 消抖 |
 
 主循环节拍约 10 ms；200 ms 采样一次数据，250 ms 刷新显示。
-详细算法（SOC、故障检测逻辑、页面逻辑）见 `version4/CLAUDE.md`。
+详细算法（SOC、故障检测逻辑、页面逻辑）见 `version5/CLAUDE.md`。
 
 ---
 

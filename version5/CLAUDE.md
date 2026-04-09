@@ -4,9 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Version Note
 
-**version4 是 F2 设置模式引入前的基线版本**（对应 Update #13, commit 33cfa2a）。
-功能范围：F1 预热 + F5 SOC 可视化 + 5 页基础显示。不含 F2 设置模式、状态机架构或按键事件系统。
-如需最新功能版本，请参阅 `../version5/`。
+**version5 是当前最新版本**，在 version4 基础上新增：
+- **F2 设置模式**：运行时可调阈值（过温、过流、欠流），双击进入/保存，长按取消
+- **状态机架构**：SysState（SYS_NORMAL / SYS_SETTING / SYS_FAULT）替代单体 while(1)
+- **模块化主循环**：Button_Update → Sensor_Update → Control_Update → UI_ProcessEvent → Display_Update
+- **按键事件系统**：单击翻页 / 双击进入设置 / 长按取消，计数式消抖（5ms 扫描 × 4 次确认）
+- **防呆默认阈值**：`ENABLE_SETTINGS_PERSISTENCE=0`，每次上电恢复默认值
 
 ## Project Overview
 
@@ -38,13 +41,36 @@ cd Debug && make clean
 | SSD1306 OLED | I2C3 (addr 0x78) | 128×64 display, 5 pages of data |
 | NTC Thermistor | ADC1 CH1 | Temperature (Steinhart-Hart equation, β=3988K, 27kΩ/10kΩ divider) |
 | MOSFET | GPIO PB5 | Load disconnect — HIGH = connected |
-| User Button (B1) | GPIO | Page navigation, 50 ms debounce |
+| User Button (B1) | GPIO | Page navigation + settings, count-based debounce |
 
 ### Main Loop (`Core/Src/main.c`)
 
-Superloop at ~10 ms tick with two independent timers:
-- **200 ms**: Sample voltage, current, temperature → update SOC, fault detection, MOSFET control
-- **250 ms**: Refresh OLED display
+Non-blocking modular superloop — no `HAL_Delay()` in main loop:
+
+```c
+while (1) {
+    BtnEvent evt = Button_Update(now);   // 5 ms scan, count-based debounce
+    Sensor_Update(now);                   // 200 ms sampling
+    Control_Update();                     // MOSFET + fault logic
+    UI_ProcessEvent(evt, now);            // state machine transitions
+    Display_Update(now);                  // 250 ms OLED refresh
+}
+```
+
+### System State Machine
+
+| State | Description |
+|---|---|
+| `SYS_NORMAL` | 正常显示模式，单击翻页 |
+| `SYS_SETTING` | F2 设置模式，双击进入/保存，长按取消 |
+| `SYS_FAULT` | 故障状态，需硬件复位 |
+
+### Button Events
+
+两层设计：底层 5ms 扫描 + 4 次计数消抖 → 上层事件状态机：
+- **单击**（BTN_EVENT_SINGLE）：翻页
+- **双击**（BTN_EVENT_DOUBLE）：进入/保存设置
+- **长按**（BTN_EVENT_LONG）：取消设置
 
 ### SOC Tracking
 
@@ -63,9 +89,9 @@ Superloop at ~10 ms tick with two independent timers:
 
 Fault state requires hardware reset to clear.
 
-### Display Pages (cycled by B1 button)
+### Display Pages (cycled by B1 single click)
 
-`SOC` → `TEMP` → `VOLT` → `CURR` → `TIME` (time-to-empty, 10 s rolling average)
+`SOC` → `TEMP` → `VOLT` → `CURR` → `TIME` → `SETTINGS` (time-to-empty uses 10 s rolling average; settings page shows editable thresholds)
 
 ### Key Source Files
 
