@@ -314,7 +314,7 @@ static uint32_t  g_edit_last_activity = 0U;
    双击/三连击处理方需回退首次单击产生的翻页副作用。 */
 typedef enum { BTN_NONE = 0, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE } BtnEvent;
 #define BTN_CLICK_MAX_MS   500U    /* 单次点击最长按住时间 */
-#define MULTI_CLICK_MS     400U    /* 连击判定窗口 */
+#define MULTI_CLICK_MS     300U    /* 连击判定窗口 */
 static uint32_t g_btn_press_start  = 0U;
 static uint8_t  g_btn_pressing     = 0U;
 static uint8_t  g_click_count      = 0U;
@@ -405,14 +405,16 @@ static void Button_Update(void)
       g_btn_pressing = 0U;
       candidate      = 0U;
       if (dur < BTN_CLICK_MAX_MS) {         /* 有效点击 */
-        g_click_count++;
-        g_last_release = HAL_GetTick();
-        /* 立即响应：每次有效松手都立即产生/升级事件。
-           主循环在 10ms 内消费；若后续松手在窗口内，
-           产生更高级别事件，由主循环处理（回退副作用）。 */
-        if (g_click_count == 1U)      g_btn_event = BTN_SINGLE;
-        else if (g_click_count == 2U) g_btn_event = BTN_DOUBLE;
-        else                          g_btn_event = BTN_TRIPLE;
+        uint32_t gap = HAL_GetTick() - g_last_release;
+        /* 释放去抖：两次有效释放间隔 < 80ms 视为触点弹跳，忽略。
+           人手双击最快也要 ~150ms，80ms 足够过滤弹跳且不误杀。 */
+        if (g_click_count == 0U || gap >= 80U) {
+          g_click_count++;
+          g_last_release = HAL_GetTick();
+          if (g_click_count == 1U)      g_btn_event = BTN_SINGLE;
+          else if (g_click_count == 2U) g_btn_event = BTN_DOUBLE;
+          else                          g_btn_event = BTN_TRIPLE;
+        }
       }
       /* 按住超过 500ms 的不算点击，忽略 */
     }
