@@ -54,6 +54,20 @@ SSD1306 oled;
 /* 改动2：删除了原来外部 PA1 按钮的端口/引脚定义，只保留去抖时间 */
 #define BTN_DEBOUNCE_MS 50U
 
+/* F2: 按键事件类型 */
+#define BTN_NONE   0U
+#define BTN_SHORT  1U
+#define BTN_LONG   2U
+
+/* F2: 长按阈值 */
+#define BTN_LONG_MS  1500U
+
+/* F2: 编辑模式 */
+typedef enum { MODE_NORMAL = 0, MODE_EDIT } EditMode;
+
+/* F2: 编辑超时（10 秒无操作自动退出，不保存） */
+#define EDIT_TIMEOUT_MS  10000U
+
 /* Pages */
 typedef enum { UI_SOC = 0, UI_SOC_CURVE, UI_TEMP, UI_VOLT, UI_CURR, UI_TIME } UiPage;
 
@@ -62,10 +76,10 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 
 /* thresholds */
 #define TEMP_HI_C            60.0f
-#define TEMP_MOSFET_OFF_C    30.0f
+#define TEMP_MOSFET_OFF_C_DEFAULT  30.0f
 
 /* 过流 / 欠流阈值：400mA / 6mA */
-#define I_OVERCURRENT_A      0.4f
+#define I_OVERCURRENT_A_DEFAULT    0.4f
 #define I_UNDERCURRENT_A     0.006f
 #define LOAD_FAULT_MS        10000U
 #define CAPACITY_AH      2.2f
@@ -78,7 +92,37 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 /* SOC */
 static float soc = 0.90f;
 static uint8_t soc_inited = 0;
-#define SOC_LOW_THRESH     0.30f
+#define SOC_LOW_THRESH_DEFAULT  0.30f
+
+/* ===== F2: 运行时可调阈值（Flash 持久化） ===== */
+static float g_mosfet_off_temp = TEMP_MOSFET_OFF_C_DEFAULT;
+static float g_overcurrent_a   = I_OVERCURRENT_A_DEFAULT;
+static float g_soc_low_thresh  = SOC_LOW_THRESH_DEFAULT;
+
+/* F2: Flash 设置存储 */
+#define SETTINGS_FLASH_ADDR  0x0807F800U  /* 末页，Page 255 */
+#define SETTINGS_FLASH_PAGE  255U
+#define SETTINGS_MAGIC       0xBEEFCAFEU
+
+/* F2: EditParamDef - 可编辑参数描述 */
+typedef struct {
+  UiPage page;       /* 关联的显示页 */
+  float *pval;       /* 指向运行时变量 */
+  float  def;        /* 默认值 */
+  float  lo;         /* 最小值 */
+  float  hi;         /* 最大值 */
+  float  step;       /* 步长 */
+} EditParamDef;
+
+static EditParamDef g_edit_params[3];  /* 在 main() 中初始化，避免 non-const initializer */
+
+static const EditParamDef *EditParam_FindByPage(UiPage pg)
+{
+  for (int i = 0; i < 3; i++) {
+    if (g_edit_params[i].page == pg) return &g_edit_params[i];
+  }
+  return (const EditParamDef *)0;
+}
 
 /* F5 SOC 历史采样 */
 #define SOC_HIST_N            64U
@@ -111,6 +155,103 @@ static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_I2C3_Init(void);
+
+/* clampf 前向声明（Flash_LoadSettings 使用） */
+static float clampf(float v, float lo, float hi);
+
+/* ===== F2: Flash 设置存储 =====
+ * 布局（20 字节，对齐到 8 字节 doubleword 边界）：
+ *   偏移 0x00: magic     (uint32_t) 0xBEEFCAFE
+ *   偏移 0x04: mosfet_off_temp (float)
+ *   偏移 0x08: overcurrent_a   (float)
+ *   偏移 0x0C: soc_low_thresh  (float)
+ *   偏移 0x10: checksum        (uint32_t) — 三个 float 的位模式异或
+ *   偏移 0x14–0x17: padding (0xFFFFFFFF)
+ * 共 24 字节 = 3 个 doubleword
+ */
+
+typedef struct {
+  uint32_t magic;
+  float    mosfet_off_temp;
+  float    overcurrent_a;
+  float    soc_low_thresh;
+  uint32_t checksum;
+  uint32_t _pad;
+} SettingsFlash;
+
+static uint32_t Settings_Checksum(float a, float b, float c)
+{
+  uint32_t ua, ub, uc;
+  memcpy(&ua, &a, sizeof(uint32_t));
+  memcpy(&ub, &b, sizeof(uint32_t));
+  memcpy(&uc, &c, sizeof(uint32_t));
+  return ua ^ ub ^ uc;
+}
+
+static void Flash_LoadSettings(void)
+{
+  const volatile SettingsFlash *p =
+      (const volatile SettingsFlash *)SETTINGS_FLASH_ADDR;
+
+  if (p->magic != SETTINGS_MAGIC) return;  /* 未初始化：保持默认值 */
+
+  uint32_t expected = Settings_Checksum(
+      p->mosfet_off_temp, p->overcurrent_a, p->soc_low_thresh);
+  if (p->checksum != expected) return;      /* 校验失败：保持默认值 */
+
+  /* 防御性边界检查 */
+  g_mosfet_off_temp = clampf(p->mosfet_off_temp, 15.0f, 50.0f);
+  g_overcurrent_a   = clampf(p->overcurrent_a,   0.1f,  0.8f);
+  g_soc_low_thresh  = clampf(p->soc_low_thresh,  0.05f, 0.50f);
+}
+
+static uint8_t Flash_SaveSettings(void)
+{
+  /* 1. 解锁 Flash */
+  if (HAL_FLASH_Unlock() != HAL_OK) return 0;
+
+  /* 2. 擦除末页 */
+  FLASH_EraseInitTypeDef erase;
+  uint32_t page_error = 0;
+  erase.TypeErase = FLASH_TYPEERASE_PAGES;
+  erase.Banks     = FLASH_BANK_1;
+  erase.Page      = SETTINGS_FLASH_PAGE;
+  erase.NbPages   = 1;
+
+  if (HAL_FLASHEx_Erase(&erase, &page_error) != HAL_OK) {
+    HAL_FLASH_Lock();
+    return 0;
+  }
+
+  /* 3. 构造要写入的数据（24 字节 = 3 doubleword） */
+  SettingsFlash s;
+  s.magic          = SETTINGS_MAGIC;
+  s.mosfet_off_temp = g_mosfet_off_temp;
+  s.overcurrent_a   = g_overcurrent_a;
+  s.soc_low_thresh  = g_soc_low_thresh;
+  s.checksum        = Settings_Checksum(
+      g_mosfet_off_temp, g_overcurrent_a, g_soc_low_thresh);
+  s._pad            = 0xFFFFFFFFU;
+
+  /* 4. 逐 doubleword 写入（用 memcpy 避免 strict-aliasing 和对齐问题） */
+  uint32_t addr = SETTINGS_FLASH_ADDR;
+  uint8_t ok = 1;
+  const uint8_t *raw = (const uint8_t *)&s;
+
+  for (int i = 0; i < 3; i++) {
+    uint64_t dw;
+    memcpy(&dw, raw + (uint32_t)i * 8U, 8U);
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                          addr, dw) != HAL_OK) {
+      ok = 0;
+      break;
+    }
+    addr += 8U;
+  }
+
+  HAL_FLASH_Lock();
+  return ok;
+}
 
 /* ===== INA228 helpers (按位宽读，避免尺度错误) ===== */
 
@@ -270,11 +411,15 @@ static float SOC_From_OCV_Cell(float v_cell)
 
 /* ===== Button debounce =====
    改动3：这里不再读外部 PA1，而是改成读板载 B1。
-   仍然保留你原来的”去抖 + 按下一次触发一次事件”逻辑。
+   保留原来的去抖逻辑，在此基础上增加长按检测。
 
    Button_Debounce_Sync()：在长时间不轮询按钮之后（例如 Warmup_Phase 结束后）
    调用一次，将状态机的 last/stable/tick 全部对齐到当前物理电平和当前 tick，
    避免因 tick=0 与 HAL_GetTick() 差值过大而在首次轮询时产生假按键事件。
+
+   返回值：BTN_NONE / BTN_SHORT / BTN_LONG
+   - BTN_SHORT：按下后在 1.5s 内松手（松手沿触发）
+   - BTN_LONG ：按住达到 1.5s 时立即触发（不等松手），松手时不再产生短按
 */
 /* 文件级标志：Button_Debounce_Sync() 置位，Button_Pressed_Event() 消费。
    必须定义在两个函数之前，避免前向引用。                          */
@@ -282,32 +427,36 @@ static volatile uint8_t g_btn_sync_needed = 0U;
 
 static void Button_Debounce_Sync(void)
 {
-  /* 由于 last/stable/tick 是 Button_Pressed_Event 内的 static local，
-     无法从外部直接赋值。通过文件级 flag 通知函数在下次入口处执行同步，
-     而不依赖外部访问 static local。                                */
   g_btn_sync_needed = 1U;
 }
 
 static uint8_t Button_Pressed_Event(void)
 {
+  /* --- 第一层：原始去抖（与原始代码逻辑完全相同） --- */
   static uint8_t  last   = 1U;
   static uint8_t  stable = 1U;
   static uint32_t tick   = 0U;
 
-  /* 读取板载 B1 当前状态 */
+  /* --- 第二层：长按检测 --- */
+  static uint32_t press_start  = 0U;    /* 稳定按下的时刻 */
+  static uint8_t  long_fired   = 0U;    /* 本次按下是否已触发长按 */
+  static uint8_t  is_pressed   = 0U;    /* 当前是否处于按下状态 */
+
   uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
 
-  /* 同步请求：将三个 static 变量全部对齐到当前物理状态和当前时刻，
-     确保不会因 tick=0 导致去抖窗口在首次调用时就已过期。
-     注意：不产生任何事件——stable 和 last 均设为 r，跳过 stable != last 条件。 */
+  /* 同步请求 */
   if (g_btn_sync_needed) {
     g_btn_sync_needed = 0U;
     last   = r;
     stable = r;
     tick   = HAL_GetTick();
-    return 0U;   /* 同步帧：本次调用不产生事件 */
+    is_pressed  = 0U;
+    long_fired  = 0U;
+    press_start = 0U;
+    return BTN_NONE;
   }
 
+  /* 原始去抖逻辑 */
   if (r != last) {
     last = r;
     tick = HAL_GetTick();
@@ -317,11 +466,33 @@ static uint8_t Button_Pressed_Event(void)
     if (stable != last) {
       stable = last;
 
-      /* 保持你原来的按下触发方式：稳定到低电平时，认为按下 */
-      if (stable == 0U) return 1U;
+      if (stable == 0U) {
+        /* 按下沿：记录按下时刻 */
+        is_pressed  = 1U;
+        long_fired  = 0U;
+        press_start = HAL_GetTick();
+        /* 不在此处产生事件 */
+      } else {
+        /* 松手沿 */
+        if (is_pressed && !long_fired) {
+          is_pressed = 0U;
+          return BTN_SHORT;
+        }
+        is_pressed = 0U;
+        long_fired = 0U;
+      }
     }
   }
-  return 0U;
+
+  /* 持续按住期间检测长按 */
+  if (is_pressed && !long_fired) {
+    if ((HAL_GetTick() - press_start) >= BTN_LONG_MS) {
+      long_fired = 1U;
+      return BTN_LONG;
+    }
+  }
+
+  return BTN_NONE;
 }
 
 /* ===== UI ===== */
@@ -337,9 +508,25 @@ static void UI_DrawHeader(const char *title)
   SSD1306_DrawString(&oled, 0, 0, title);
 }
 
+/* F2: 页脚根据模式和页面动态显示
+ * edit_mode: 当前编辑模式（MODE_NORMAL/MODE_EDIT）
+ * pg:        当前页面
+ * 全局状态下由 UI_DrawFooterEx() 处理，保留 UI_DrawFooter() 作为简单包装 */
+static EditMode g_edit_mode_for_footer = MODE_NORMAL;
+static UiPage   g_page_for_footer     = UI_SOC;
+
 static void UI_DrawFooter(void)
 {
-  SSD1306_DrawString(&oled, 0, 6, "BTN: NEXT");
+  if (g_edit_mode_for_footer == MODE_EDIT) {
+    SSD1306_DrawString(&oled, 0, 6, "S:+step L:save");
+  } else {
+    /* 普通模式：可编辑页显示两种操作提示 */
+    if (EditParam_FindByPage(g_page_for_footer) != (const EditParamDef *)0) {
+      SSD1306_DrawString(&oled, 0, 6, "S:page L:edit");
+    } else {
+      SSD1306_DrawString(&oled, 0, 6, "S:page");
+    }
+  }
 }
 
 static void UI_DrawSOCCurve(void)
@@ -515,6 +702,33 @@ static void UI_ShowTime(float tte_sec)
   SSD1306_Update(&oled);
 }
 
+/* F2: 编辑模式值显示覆盖层
+ * 在正常页面绘制完成后（SSD1306_Update 已调用），覆盖 page 4 (y32) 显示编辑值，
+ * 然后再次 SSD1306_Update。
+ * 格式：TEMP -> "[30 C]"  CURR -> "[400 mA]"  SOC -> "[30%]"
+ */
+static void UI_ShowEditOverlay(UiPage pg, float val)
+{
+  char buf[20];
+
+  if (pg == UI_TEMP) {
+    int v = (int)roundf(val);
+    snprintf(buf, sizeof(buf), "[%d C]", v);
+  } else if (pg == UI_CURR) {
+    int ma = (int)roundf(val * 1000.0f);
+    snprintf(buf, sizeof(buf), "[%d mA]", ma);
+  } else if (pg == UI_SOC) {
+    int pct = (int)roundf(val * 100.0f);
+    snprintf(buf, sizeof(buf), "[%d%%]", pct);
+  } else {
+    return;  /* 不可编辑的页面 */
+  }
+
+  /* 在 page 4 (y32-39) 显示编辑值 */
+  SSD1306_DrawString(&oled, 0, 4, buf);
+  SSD1306_Update(&oled);
+}
+
 static void UI_ShowFault(FaultType f)
 {
   UI_DrawHeader("FAULT");
@@ -600,6 +814,23 @@ int main(void)
 
   INA228_Init_Simple();
 
+  /* F2: 初始化编辑参数描述表 */
+  g_edit_params[0] = (EditParamDef){
+    .page = UI_TEMP, .pval = &g_mosfet_off_temp,
+    .def = TEMP_MOSFET_OFF_C_DEFAULT, .lo = 15.0f, .hi = 50.0f, .step = 5.0f
+  };
+  g_edit_params[1] = (EditParamDef){
+    .page = UI_CURR, .pval = &g_overcurrent_a,
+    .def = I_OVERCURRENT_A_DEFAULT, .lo = 0.1f, .hi = 0.8f, .step = 0.05f
+  };
+  g_edit_params[2] = (EditParamDef){
+    .page = UI_SOC, .pval = &g_soc_low_thresh,
+    .def = SOC_LOW_THRESH_DEFAULT, .lo = 0.05f, .hi = 0.50f, .step = 0.05f
+  };
+
+  /* F2: 从 Flash 加载用户保存的阈值（覆盖默认值） */
+  Flash_LoadSettings();
+
   BspCOMInit.BaudRate   = 115200;
   BspCOMInit.WordLength = COM_WORDLENGTH_8B;
   BspCOMInit.StopBits   = COM_STOPBITS_1;
@@ -631,16 +862,69 @@ int main(void)
     static uint32_t last_draw = 0;
     static uint32_t bad_load_ms = 0;
 
-    if (Button_Pressed_Event()) {
+    /* F2: 编辑模式状态 */
+    static EditMode edit_mode = MODE_NORMAL;
+    static float    edit_val  = 0.0f;    /* 当前编辑中的临时值 */
+    static uint32_t edit_last_action = 0; /* 上次操作时刻（超时检测） */
+
+    uint8_t btn = Button_Pressed_Event();
+
+    if (btn == BTN_SHORT) {
       if (fault == FAULT_NONE) {
-        if (page == UI_SOC)       page = UI_SOC_CURVE;
-        else if (page == UI_SOC_CURVE) page = UI_TEMP;
-        else if (page == UI_TEMP) page = UI_VOLT;
-        else if (page == UI_VOLT) page = UI_CURR;
-        else if (page == UI_CURR) page = UI_TIME;
-        else page = UI_SOC;
+        if (edit_mode == MODE_NORMAL) {
+          /* 普通模式：短按翻页（与原逻辑完全一致） */
+          if (page == UI_SOC)            page = UI_SOC_CURVE;
+          else if (page == UI_SOC_CURVE) page = UI_TEMP;
+          else if (page == UI_TEMP)      page = UI_VOLT;
+          else if (page == UI_VOLT)      page = UI_CURR;
+          else if (page == UI_CURR)      page = UI_TIME;
+          else                           page = UI_SOC;
+        } else {
+          /* 编辑模式：短按递增（循环） */
+          const EditParamDef *ep = EditParam_FindByPage(page);
+          if (ep != (const EditParamDef *)0) {
+            edit_val += ep->step;
+            if (edit_val > ep->hi + ep->step * 0.5f) {
+              edit_val = ep->lo;
+            }
+            edit_val = roundf(edit_val / ep->step) * ep->step;
+            edit_val = clampf(edit_val, ep->lo, ep->hi);
+            edit_last_action = HAL_GetTick();
+          }
+        }
+      }
+    } else if (btn == BTN_LONG) {
+      if (fault == FAULT_NONE) {
+        if (edit_mode == MODE_NORMAL) {
+          /* 普通模式：长按进入编辑（仅可编辑页） */
+          const EditParamDef *ep = EditParam_FindByPage(page);
+          if (ep != (const EditParamDef *)0) {
+            edit_mode = MODE_EDIT;
+            edit_val  = *(ep->pval);
+            edit_last_action = HAL_GetTick();
+          }
+        } else {
+          /* 编辑模式：长按保存并退出 */
+          const EditParamDef *ep = EditParam_FindByPage(page);
+          if (ep != (const EditParamDef *)0) {
+            *(ep->pval) = clampf(edit_val, ep->lo, ep->hi);
+            Flash_SaveSettings();
+          }
+          edit_mode = MODE_NORMAL;
+        }
       }
     }
+
+    /* F2: 编辑超时检测（10 秒无操作自动退出，不保存） */
+    if (edit_mode == MODE_EDIT) {
+      if ((HAL_GetTick() - edit_last_action) >= EDIT_TIMEOUT_MS) {
+        edit_mode = MODE_NORMAL;
+      }
+    }
+
+    /* 更新页脚显示所需的全局状态 */
+    g_edit_mode_for_footer = edit_mode;
+    g_page_for_footer      = page;
 
     uint32_t now = HAL_GetTick();
 
@@ -712,7 +996,7 @@ int main(void)
         if (fault == FAULT_NONE) {
           float absI = fabsf(ia);
           uint8_t load_bad = 0;
-          if (absI > I_OVERCURRENT_A) load_bad = 1;
+          if (absI > g_overcurrent_a) load_bad = 1;
           else if (absI < I_UNDERCURRENT_A) load_bad = 1;
 
           if (load_bad) {
@@ -730,7 +1014,7 @@ int main(void)
       }
 
       /* MOSFET 控制始终执行 */
-      if (isnan(tC) || (tC > TEMP_MOSFET_OFF_C) || (fault != FAULT_NONE)) {
+      if (isnan(tC) || (tC > g_mosfet_off_temp) || (fault != FAULT_NONE)) {
         HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_RESET);
       } else {
         HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_SET);
@@ -744,7 +1028,7 @@ int main(void)
         UI_ShowFault(fault);
       } else {
         int soc_percent = (int)(soc * 100.0f + 0.5f);
-        uint8_t soc_low = (soc < SOC_LOW_THRESH) ? 1 : 0;
+        uint8_t soc_low = (soc < g_soc_low_thresh) ? 1 : 0;
 
         if (page == UI_SOC)            UI_ShowSOC(soc_percent, soc_low);
         else if (page == UI_SOC_CURVE) UI_ShowSOCCurvePage();
@@ -753,7 +1037,12 @@ int main(void)
         else if (page == UI_CURR)      UI_ShowCurr(ia);
         else                           UI_ShowTime(tte_sec);
 
-        if (soc_low) {
+        /* F2: 编辑模式覆盖层 */
+        if (edit_mode == MODE_EDIT) {
+          UI_ShowEditOverlay(page, edit_val);
+        }
+
+        if (soc_low && edit_mode == MODE_NORMAL) {
           SSD1306_DrawString(&oled, 0, 5, "SOC TOO LOW");
           SSD1306_Update(&oled);
         }
