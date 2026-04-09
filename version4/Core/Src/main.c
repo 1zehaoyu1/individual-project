@@ -51,8 +51,12 @@ SSD1306 oled;
 #define MOSFET_GPIO_Port GPIOB
 #define MOSFET_Pin       GPIO_PIN_5
 
-/* 改动2：删除了原来外部 PA1 按钮的端口/引脚定义，只保留去抖时间 */
-#define BTN_DEBOUNCE_MS 50U
+/* 按键扫描与去抖参数 */
+#define BTN_SCAN_MS       5U    /* 去抖扫描周期（5ms） */
+#define BTN_DEBOUNCE_CNT  4U    /* 连续一致次数才确认（4×5ms=20ms） */
+
+/* 可选：打开此宏在 UART 上输出按键调试信息（提交时保持注释） */
+/* #define BTN_DEBUG_UART */
 
 /* 按键事件 */
 typedef enum {
@@ -434,20 +438,41 @@ static float SOC_From_OCV_Cell(float v_cell)
   return 0.5f;
 }
 
-/* ===== 按键模块：去抖 + 单击/双击/长按检测 =====
+/* ===== 按键模块：计数式去抖 + 单击/双击/长按检测 =====
  *
- * 两层设计：
- *   Layer 1 - Button_ReadStable()：原始 GPIO 去抖，输出稳定电平
- *   Layer 2 - Button_Update()：事件状态机，输出 BtnEvent
+ * 三层设计：
+ *   Layer 0 - Button_IsPressedRaw()：封装 BSP 返回值，输出 1=按下 0=松开
+ *   Layer 1 - 计数式去抖（集成在 Button_Update 内部）
+ *   Layer 2 - 事件状态机，输出 BtnEvent
+ *
+ * 去抖策略：
+ *   每 BTN_SCAN_MS（5ms）采样一次 GPIO，连续 BTN_DEBOUNCE_CNT（4）次
+ *   一致才确认状态变化。确认时间 = 5ms × 4 = 20ms。
  *
  * 事件语义：
  *   BTN_EVENT_SINGLE：单击（松手后等待双击窗口超时才确认）
- *   BTN_EVENT_DOUBLE：双击（第二次松手沿触发）
+ *   BTN_EVENT_DOUBLE：双击（第二次稳定松开后确认）
  *   BTN_EVENT_LONG  ：长按（按住达到阈值立即触发，松手时不再产生单击）
  *
  * Button_Sync()：预热结束后调用一次，将内部状态对齐到当前物理电平，
  *   避免因 tick=0 与 HAL_GetTick() 差值过大而产生假事件。
+ *
+ * 硬件事实（NUCLEO-G491RE B1 USER 按钮）：
+ *   BSP_PB_Init 配置 PC13 为 GPIO_PULLDOWN。
+ *   空闲时 PC13 被拉低 → BSP_PB_GetState 返回 0。
+ *   按下时 PC13 连接到 VDD → BSP_PB_GetState 返回 1。
+ *   即：BSP 返回值 1 = 按下，0 = 松开（active-HIGH）。
  */
+
+/* Layer 0：封装原始读取，屏蔽硬件极性
+ * 返回 1 = 按下，0 = 松开 */
+static uint8_t Button_IsPressedRaw(void)
+{
+  /* NUCLEO-G491RE B1：GPIO_PULLDOWN，active-HIGH
+   * BSP_PB_GetState 返回 GPIO 物理电平：1=pressed, 0=released
+   * 如果硬件改为 active-LOW，只需在此处取反 */
+  return (uint8_t)(BSP_PB_GetState(BUTTON_USER) != 0);
+}
 
 typedef enum {
     BS_IDLE = 0,
@@ -464,45 +489,88 @@ static void Button_Sync(void)
   g_btn_sync_needed = 1U;
 }
 
-/* Layer 1：去抖（50 ms 稳定窗口） */
-static uint8_t Button_ReadStable(uint32_t now)
-{
-  static uint8_t  last      = 1U;
-  static uint8_t  stable    = 1U;
-  static uint32_t edge_tick = 0U;
-
-  if (g_btn_sync_needed) {
-    uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
-    last      = r;
-    stable    = r;
-    edge_tick = now;
-    g_btn_sync_needed = 0U;
-    return stable;
-  }
-
-  uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
-  if (r != last) {
-    last      = r;
-    edge_tick = now;
-  }
-  if ((now - edge_tick) >= BTN_DEBOUNCE_MS && stable != last) {
-    stable = last;
-  }
-  return stable;  /* 0 = pressed, 1 = released */
-}
-
-/* Layer 2：事件状态机 */
+/* Layer 1+2 合并：5ms 定时扫描 → 计数式去抖 → 事件状态机 */
 static BtnEvent Button_Update(uint32_t now)
 {
+  /* --- 5ms 扫描节拍控制 --- */
+  static uint32_t last_scan_tick = 0U;
+  if ((now - last_scan_tick) < BTN_SCAN_MS) {
+    return BTN_EVENT_NONE;  /* 未到扫描时刻，直接返回 */
+  }
+  last_scan_tick = now;
+
+  /* --- 计数式去抖 --- */
+  static uint8_t  debounce_cnt = 0U;
+  static uint8_t  stable       = 0U;  /* 0=released, 1=pressed（去抖后） */
+
+  /* --- 事件状态机 --- */
   static BtnInternalState state = BS_IDLE;
   static uint32_t state_tick    = 0U;
-  static uint8_t  prev_stable   = 1U;
+  static uint8_t  prev_stable   = 0U;
 
-  uint8_t cur          = Button_ReadStable(now);
-  uint8_t press_edge   = (prev_stable == 1U && cur == 0U);
-  uint8_t release_edge = (prev_stable == 0U && cur == 1U);
-  prev_stable = cur;
+  /* 同步请求：预热后对齐到当前物理电平 */
+  if (g_btn_sync_needed) {
+    uint8_t raw     = Button_IsPressedRaw();
+    stable          = raw;
+    prev_stable     = raw;
+    debounce_cnt    = 0U;
+    state           = BS_IDLE;
+    state_tick      = now;
+    last_scan_tick  = now;
+    g_btn_sync_needed = 0U;
+    return BTN_EVENT_NONE;
+  }
 
+  /* 采样并做计数式去抖 */
+  uint8_t raw = Button_IsPressedRaw();
+
+#ifdef BTN_DEBUG_UART
+  {
+    /* 仅在电平变化时打印，避免刷屏 */
+    static uint8_t dbg_last_raw = 0xFFU;
+    if (raw != dbg_last_raw) {
+      dbg_last_raw = raw;
+      char dbg[32];
+      int n = snprintf(dbg, sizeof(dbg), "[BTN] raw=%u stable=%u\r\n",
+                        (unsigned)raw, (unsigned)stable);
+      if (n > 0) {
+        HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t *)dbg,
+                          (uint16_t)n, 10);
+      }
+    }
+  }
+#endif
+
+  if (raw == stable) {
+    /* 当前读数与稳定值一致：清零计数器 */
+    debounce_cnt = 0U;
+  } else {
+    /* 当前读数与稳定值不同：累加计数 */
+    debounce_cnt++;
+    if (debounce_cnt >= BTN_DEBOUNCE_CNT) {
+      stable       = raw;
+      debounce_cnt = 0U;
+
+#ifdef BTN_DEBUG_UART
+      {
+        char dbg[32];
+        int n = snprintf(dbg, sizeof(dbg), "[BTN] STABLE->%u\r\n",
+                          (unsigned)stable);
+        if (n > 0) {
+          HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t *)dbg,
+                            (uint16_t)n, 10);
+        }
+      }
+#endif
+    }
+  }
+
+  /* --- 边沿检测（基于去抖后的 stable 值） --- */
+  uint8_t press_edge   = (prev_stable == 0U && stable == 1U);
+  uint8_t release_edge = (prev_stable == 1U && stable == 0U);
+  prev_stable = stable;
+
+  /* --- 事件状态机 --- */
   switch (state) {
   case BS_IDLE:
     if (press_edge) {
@@ -516,7 +584,7 @@ static BtnEvent Button_Update(uint32_t now)
       /* 第一次松手：进入双击等待窗口 */
       state      = BS_WAIT_DOUBLE;
       state_tick = now;
-    } else if (cur == 0U && (now - state_tick) >= BTN_LONG_MS) {
+    } else if (stable == 1U && (now - state_tick) >= BTN_LONG_MS) {
       /* 长按触发 */
       state = BS_WAIT_RELEASE;
       return BTN_EVENT_LONG;
@@ -540,7 +608,7 @@ static BtnEvent Button_Update(uint32_t now)
       /* 第二次松手：确认双击 */
       state = BS_IDLE;
       return BTN_EVENT_DOUBLE;
-    } else if (cur == 0U && (now - state_tick) >= BTN_LONG_MS) {
+    } else if (stable == 1U && (now - state_tick) >= BTN_LONG_MS) {
       /* 第二次按住超时：当做双击处理，等松手 */
       state = BS_WAIT_RELEASE;
       return BTN_EVENT_DOUBLE;
