@@ -106,7 +106,9 @@ static float soc = 0.90f;
 static uint8_t soc_inited = 0;
 #define SOC_LOW_THRESH_DEFAULT  0.30f
 
-/* ===== F2: 运行时可调阈值（Flash 持久化） ===== */
+/* ===== F2: 运行时可调阈值 ===== */
+/* 设为 1 则开机从 Flash 加载上次保存的阈值；设为 0 则每次开机恢复默认值 */
+#define ENABLE_SETTINGS_PERSISTENCE  0
 static float g_mosfet_off_temp = TEMP_MOSFET_OFF_C_DEFAULT;
 static float g_overcurrent_a   = I_OVERCURRENT_A_DEFAULT;
 static float g_soc_low_thresh  = SOC_LOW_THRESH_DEFAULT;
@@ -188,6 +190,7 @@ static void MX_I2C3_Init(void);
 /* clampf 前向声明（Flash_LoadSettings 使用） */
 static float clampf(float v, float lo, float hi);
 
+#if ENABLE_SETTINGS_PERSISTENCE
 /* ===== F2: Flash 设置存储 =====
  * 布局（20 字节，对齐到 8 字节 doubleword 边界）：
  *   偏移 0x00: magic     (uint32_t) 0xBEEFCAFE
@@ -281,6 +284,7 @@ static uint8_t Flash_SaveSettings(void)
   HAL_FLASH_Lock();
   return ok;
 }
+#endif /* ENABLE_SETTINGS_PERSISTENCE */
 
 /* ===== INA228 helpers (按位宽读，避免尺度错误) ===== */
 
@@ -1075,7 +1079,9 @@ static void UI_ProcessEvent(BtnEvent evt, uint32_t now)
       const EditParamDef *ep = EditParam_FindByPage(ui_page);
       if (ep != (const EditParamDef *)0) {
         *(ep->pval) = clampf(edit_val, ep->lo, ep->hi);
+#if ENABLE_SETTINGS_PERSISTENCE
         Flash_SaveSettings();
+#endif
       }
       sys_state = SYS_NORMAL;
     } else if (evt == BTN_EVENT_LONG) {
@@ -1160,7 +1166,9 @@ int main(void)
   };
 
   /* F2: 从 Flash 加载用户保存的阈值（覆盖默认值） */
+#if ENABLE_SETTINGS_PERSISTENCE
   Flash_LoadSettings();
+#endif
 
   BspCOMInit.BaudRate   = 115200;
   BspCOMInit.WordLength = COM_WORDLENGTH_8B;
