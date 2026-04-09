@@ -51,9 +51,6 @@ SSD1306 oled;
 #define MOSFET_GPIO_Port GPIOB
 #define MOSFET_Pin       GPIO_PIN_5
 
-/* 改动2：删除了原来外部 PA1 按钮的端口/引脚定义，只保留去抖时间 */
-#define BTN_DEBOUNCE_MS 50U
-
 /* Pages */
 typedef enum { UI_SOC = 0, UI_SOC_CURVE, UI_TEMP, UI_VOLT, UI_CURR, UI_TIME } UiPage;
 
@@ -311,7 +308,10 @@ static float     g_edit_val           = 0.0f;
 static uint32_t  g_edit_last_activity = 0U;
 #define EDIT_TIMEOUT_MS  10000U
 
-/* ===== Button (multi-click) ===== */
+/* ===== Button (multi-click, immediate-first) ===== */
+/* 策略：首次松手立即产生 BTN_SINGLE（翻页无延迟），
+   后续在 MULTI_CLICK_MS 窗口内继续按则升级为 BTN_DOUBLE / BTN_TRIPLE。
+   双击/三连击处理方需回退首次单击产生的翻页副作用。 */
 typedef enum { BTN_NONE = 0, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE } BtnEvent;
 #define BTN_CLICK_MAX_MS   500U    /* 单次点击最长按住时间 */
 #define MULTI_CLICK_MS     400U    /* 连击判定窗口 */
@@ -321,19 +321,33 @@ static uint8_t  g_click_count      = 0U;
 static uint32_t g_last_release     = 0U;
 static BtnEvent g_btn_event        = BTN_NONE;
 
-/* ===== Transient hint ===== */
-static char     g_hint_text[24]  = {0};
-static uint32_t g_hint_set_tick  = 0U;
-#define HINT_DURATION_MS  1500U
+/* ===== Bottom hint (two layers: flash > default) ===== */
+/* 默认提示始终显示；临时闪现提示（如 "Saved"）在 HINT_FLASH_MS 后消退回默认。 */
+static char     g_hint_default[24] = {0};     /* 持久：由模式/页面决定 */
+static char     g_hint_flash[24]   = {0};     /* 临时：事件触发，带超时 */
+static uint32_t g_hint_flash_tick  = 0U;
+#define HINT_FLASH_MS  1500U
 
-static void Hint_Set(const char *s) {
-  strncpy(g_hint_text, s, sizeof(g_hint_text) - 1U);
-  g_hint_text[sizeof(g_hint_text) - 1U] = '\0';
-  g_hint_set_tick = HAL_GetTick();
+/* 设置持久默认提示（每帧调用，无超时） */
+static void Hint_SetDefault(const char *s) {
+  strncpy(g_hint_default, s, sizeof(g_hint_default) - 1U);
+  g_hint_default[sizeof(g_hint_default) - 1U] = '\0';
 }
+
+/* 设置临时闪现提示（事件触发：Saved / ERR / Cancelled） */
+static void Hint_Flash(const char *s) {
+  strncpy(g_hint_flash, s, sizeof(g_hint_flash) - 1U);
+  g_hint_flash[sizeof(g_hint_flash) - 1U] = '\0';
+  g_hint_flash_tick = HAL_GetTick();
+}
+
+/* 获取当前应显示的提示：flash 优先，超时后回退到 default */
 static const char *Hint_Get(void) {
-  if (g_hint_text[0] == '\0') return NULL;
-  return ((HAL_GetTick() - g_hint_set_tick) < HINT_DURATION_MS) ? g_hint_text : NULL;
+  if (g_hint_flash[0] != '\0' &&
+      (HAL_GetTick() - g_hint_flash_tick) < HINT_FLASH_MS)
+    return g_hint_flash;
+  if (g_hint_default[0] != '\0') return g_hint_default;
+  return NULL;
 }
 
 /* ===== Button debounce =====
@@ -344,15 +358,13 @@ static const char *Hint_Get(void) {
    调用一次，将状态机的 last/stable/tick 全部对齐到当前物理电平和当前 tick，
    避免因 tick=0 与 HAL_GetTick() 差值过大而在首次轮询时产生假按键事件。
 */
-/* 文件级标志：Button_Debounce_Sync() 置位，Button_Pressed_Event() 消费。
+/* 文件级标志：Button_Debounce_Sync() 置位，Button_Update() 消费。
    必须定义在两个函数之前，避免前向引用。                          */
 static volatile uint8_t g_btn_sync_needed = 0U;
 
 static void Button_Debounce_Sync(void)
 {
-  /* 由于 last/stable/tick 是 Button_Pressed_Event 内的 static local，
-     无法从外部直接赋值。通过文件级 flag 通知函数在下次入口处执行同步，
-     而不依赖外部访问 static local。                                */
+  /* 通过文件级 flag 通知 Button_Update() 在下次入口处执行同步。        */
   g_btn_sync_needed = 1U;
 }
 
@@ -395,17 +407,20 @@ static void Button_Update(void)
       if (dur < BTN_CLICK_MAX_MS) {         /* 有效点击 */
         g_click_count++;
         g_last_release = HAL_GetTick();
+        /* 立即响应：每次有效松手都立即产生/升级事件。
+           主循环在 10ms 内消费；若后续松手在窗口内，
+           产生更高级别事件，由主循环处理（回退副作用）。 */
+        if (g_click_count == 1U)      g_btn_event = BTN_SINGLE;
+        else if (g_click_count == 2U) g_btn_event = BTN_DOUBLE;
+        else                          g_btn_event = BTN_TRIPLE;
       }
       /* 按住超过 500ms 的不算点击，忽略 */
     }
   }
 
-  /* 连击窗口到期 → 产生事件 */
+  /* 连击窗口到期 → 清除计数器，为下一轮连击做准备 */
   if (g_click_count > 0U &&
       (HAL_GetTick() - g_last_release) >= MULTI_CLICK_MS) {
-    if (g_click_count == 1U)      g_btn_event = BTN_SINGLE;
-    else if (g_click_count == 2U) g_btn_event = BTN_DOUBLE;
-    else                          g_btn_event = BTN_TRIPLE;
     g_click_count = 0U;
   }
 }
@@ -491,7 +506,7 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low,
     int ev = (int)(edit_val * 100.0f + 0.5f);
     snprintf(txt, sizeof(txt), "[%d%%]", ev);
     SSD1306_DrawString(&oled, 0, 4, txt);
-    SSD1306_DrawString(&oled, 0, 6, "3x:+5 2x:save");
+    SSD1306_DrawString(&oled, 0, 6, "1x:+5 2x:save");
   } else {
     if (soc_low)
       SSD1306_DrawString(&oled, 92, 4, "LOW");
@@ -527,7 +542,7 @@ static void UI_ShowTemp(float tC, uint8_t edit_mode, float edit_val)
     int ei = (int)edit_val;
     snprintf(l2, sizeof(l2), "[%d C]", ei);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    SSD1306_DrawString(&oled, 0, 6, "3x:+5 2x:save");
+    SSD1306_DrawString(&oled, 0, 6, "1x:+5 2x:save");
   } else {
     /* 正常：显示当前生效阈值 */
     int gi = (int)g_mosfet_off_temp;
@@ -572,7 +587,7 @@ static void UI_ShowCurr(float ia, uint8_t edit_mode, float edit_val)
     int ev = (int)(edit_val * 1000.0f + 0.5f);
     snprintf(l2, sizeof(l2), "[%d mA]", ev);
     SSD1306_DrawString(&oled, 0, 4, l2);
-    SSD1306_DrawString(&oled, 0, 6, "3x:+50 2x:save");
+    SSD1306_DrawString(&oled, 0, 6, "1x:+50 2x:save");
   } else {
     { const char *_h = Hint_Get(); if (_h) SSD1306_DrawString(&oled, 0, 6, _h); }
   }
@@ -809,11 +824,11 @@ int main(void)
 
   Warmup_Phase();
 
-  /* 预热阶段（约 3000 ms）期间完全不轮询按钮，导致 Button_Pressed_Event
+  /* 预热阶段（约 3000 ms）期间完全不轮询按钮，导致 Button_Update()
      内部 tick=0 与 HAL_GetTick()≈3000 之间存在巨大差值，首次轮询时去抖
      窗口立即过期，若按钮电平与初始假设不符就会产生假按键事件。
-     此处请求同步：下次 Button_Pressed_Event() 调用时将 last/stable/tick
-     全部对齐到当前物理电平和当前时刻，不产生任何事件。              */
+     此处请求同步：下次 Button_Update() 调用时对齐到当前物理电平和
+     当前时刻，不产生任何事件。                                      */
   Button_Debounce_Sync();
 
   while (1)
@@ -823,6 +838,7 @@ int main(void)
     static float tC   = NAN;
     static float tte_sec = NAN;
     static UiPage page = UI_SOC;
+    static UiPage prev_page = UI_SOC;   /* 翻页前记录，供双击回退 */
     static FaultType fault = FAULT_NONE;
 
     static uint32_t last_sample = 0;
@@ -836,46 +852,55 @@ int main(void)
 
     if (g_mode == MODE_NORMAL) {
       if (ev == BTN_SINGLE && fault == FAULT_NONE) {
-        /* 单击：翻页 */
+        /* 单击：立即翻页（~150ms 响应，无 400ms 等待窗口） */
+        prev_page = page;
         page = (page == UI_TIME) ? UI_SOC : (UiPage)(page + 1);
-        Hint_Set("Next Page");
       } else if (ev == BTN_DOUBLE && fault == FAULT_NONE) {
-        /* 双击：在可编辑页进入设置模式 */
+        /* 双击：进入设置模式。
+           因为立即响应策略，首次松手已触发翻页（BTN_SINGLE），
+           这里需回退到翻页前的页面再检查是否可编辑。 */
+        page = prev_page;
         int idx = EditParam_FindByPage(page);
         if (idx >= 0) {
           g_edit_idx           = idx;
           g_edit_val           = *g_edit_params[idx].p_runtime;
           g_edit_last_activity = now;
           g_mode               = MODE_EDIT;
-          Hint_Set("EDIT");
         }
+        /* 不可编辑页：回退翻页，停留在原页 */
       }
     } else {  /* MODE_EDIT */
       /* 故障发生时立即退出编辑，不保存 */
       if (fault != FAULT_NONE) {
         g_mode = MODE_NORMAL;
-        Hint_Set("FAULT");
-      } else if (ev == BTN_TRIPLE) {
-        /* 三连击：循环递增 */
+      } else if (ev == BTN_SINGLE) {
+        /* 单击：循环递增编辑值（原三连击功能移至单击，操作更简单） */
         const EditParamDef *def = &g_edit_params[g_edit_idx];
         g_edit_val += def->step;
         if (g_edit_val > def->max_val + def->step * 0.1f)
           g_edit_val = def->min_val;
+        /* 消除 float 累积误差：对齐到步长网格 */
+        g_edit_val = roundf(g_edit_val / def->step) * def->step;
         g_edit_last_activity = now;
       } else if (ev == BTN_DOUBLE) {
-        /* 双击：保存并退出 */
+        /* 双击：保存并退出。
+           因立即响应策略，首次松手 BTN_SINGLE 已递增一次 edit_val，
+           这里回退该次递增，使双击仅执行"保存"语义。 */
         const EditParamDef *def = &g_edit_params[g_edit_idx];
+        g_edit_val -= def->step;
+        if (g_edit_val < def->min_val - def->step * 0.1f)
+          g_edit_val = def->max_val;
         *def->p_runtime = g_edit_val;
         if (Flash_SaveSettings())
-          Hint_Set("Saved");
+          Hint_Flash("Saved");
         else
-          Hint_Set("ERR:Flash");
+          Hint_Flash("ERR:Flash");
         g_mode = MODE_NORMAL;
       }
       /* 超时检查 */
       if (g_mode == MODE_EDIT && (now - g_edit_last_activity >= EDIT_TIMEOUT_MS)) {
         g_mode = MODE_NORMAL;
-        Hint_Set("Cancelled");
+        Hint_Flash("Cancelled");
       }
     }
 
@@ -976,8 +1001,18 @@ int main(void)
       last_draw = now;
 
       if (fault != FAULT_NONE) {
+        Hint_SetDefault("FAULT");
         UI_ShowFault(fault);
       } else {
+        /* 每帧更新默认底部提示 */
+        if (g_mode == MODE_NORMAL) {
+          if (EditParam_FindByPage(page) >= 0)
+            Hint_SetDefault("1x:page 2x:edit");
+          else
+            Hint_SetDefault("1x:page");
+        }
+        /* 编辑模式的底部提示由各 UI 函数硬编码（"1x:+N 2x:save"） */
+
         int soc_percent = (int)(soc * 100.0f + 0.5f);
         uint8_t soc_low = (soc < g_soc_low_thresh) ? 1 : 0;
 
