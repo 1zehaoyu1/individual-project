@@ -308,17 +308,14 @@ static float     g_edit_val           = 0.0f;
 static uint32_t  g_edit_last_activity = 0U;
 #define EDIT_TIMEOUT_MS  10000U
 
-/* ===== Button (multi-click, immediate-first) ===== */
-/* 策略：首次松手立即产生 BTN_SINGLE（翻页无延迟），
-   后续在 MULTI_CLICK_MS 窗口内继续按则升级为 BTN_DOUBLE / BTN_TRIPLE。
-   双击/三连击处理方需回退首次单击产生的翻页副作用。 */
-typedef enum { BTN_NONE = 0, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE } BtnEvent;
-#define BTN_CLICK_MAX_MS   500U    /* 单次点击最长按住时间 */
-#define MULTI_CLICK_MS     300U    /* 连击判定窗口 */
-static uint32_t g_btn_press_start  = 0U;
-static uint8_t  g_btn_pressing     = 0U;
-static uint8_t  g_click_count      = 0U;
-static uint32_t g_last_release     = 0U;
+/* ===== Button (wait-then-decide) ===== */
+/* 策略：每次释放后等待 DBLCLICK_WINDOW_MS 窗口：
+   - 窗口内再次按下并释放 → BTN_DOUBLE
+   - 窗口到期无第二次按下 → BTN_SINGLE
+   单击有最多 300ms 延迟，但保证 100% 可靠（与 version3 相同的消抖基础）。 */
+typedef enum { BTN_NONE = 0, BTN_SINGLE, BTN_DOUBLE } BtnEvent;
+#define BTN_CLICK_MAX_MS      500U    /* 单次点击最长按住时间 */
+#define DBLCLICK_WINDOW_MS    300U    /* 双击判定窗口 */
 static BtnEvent g_btn_event        = BTN_NONE;
 
 /* ===== Bottom hint (two layers: flash > default) ===== */
@@ -350,80 +347,126 @@ static const char *Hint_Get(void) {
   return NULL;
 }
 
-/* ===== Button debounce =====
-   改动3：这里不再读外部 PA1，而是改成读板载 B1。
-   仍然保留你原来的”去抖 + 按下一次触发一次事件”逻辑。
+/* ===== Button debounce (wait-then-decide) =====
+   基于 version3 经硬件验证的消抖逻辑，增加双击检测。
 
-   Button_Debounce_Sync()：在长时间不轮询按钮之后（例如 Warmup_Phase 结束后）
-   调用一次，将状态机的 last/stable/tick 全部对齐到当前物理电平和当前 tick，
-   避免因 tick=0 与 HAL_GetTick() 差值过大而在首次轮询时产生假按键事件。
+   状态机：
+     IDLE → 检测到稳定按下沿 → PRESSED
+     PRESSED → 检测到稳定释放沿（且按住时长 < 500ms）→ WAIT_2ND（开启窗口）
+     WAIT_2ND → 窗口内再次按下并释放 → 产生 BTN_DOUBLE，回到 IDLE
+     WAIT_2ND → 窗口到期 → 产生 BTN_SINGLE，回到 IDLE
+
+   Button_Debounce_Sync()：在预热阶段结束后调用一次，将状态机对齐到当前
+   物理电平和时刻，避免假事件。
 */
-/* 文件级标志：Button_Debounce_Sync() 置位，Button_Update() 消费。
-   必须定义在两个函数之前，避免前向引用。                          */
+#define BTN_DEBOUNCE_MS  50U
+
 static volatile uint8_t g_btn_sync_needed = 0U;
 
 static void Button_Debounce_Sync(void)
 {
-  /* 通过文件级 flag 通知 Button_Update() 在下次入口处执行同步。        */
   g_btn_sync_needed = 1U;
 }
 
 static void Button_Update(void)
 {
-  static uint8_t  candidate      = 0U;
-  static uint32_t candidate_tick = 0U;
-#define BTN_DEBOUNCE_MS  50U
+  /* 消抖层：与 version3 相同的 last/stable/tick 三变量消抖 */
+  static uint8_t  last   = 1U;   /* 上次读到的原始电平 */
+  static uint8_t  stable = 1U;   /* 消抖后的稳定电平 */
+  static uint32_t tick   = 0U;   /* 上次电平变化的时刻 */
+
+  /* 多击检测层 */
+  typedef enum { S_IDLE = 0, S_PRESSED, S_WAIT_2ND, S_PRESSED_2ND } ClickState;
+  static ClickState cstate         = S_IDLE;
+  static uint32_t   press_start    = 0U;  /* 按下起始时刻 */
+  static uint32_t   first_release  = 0U;  /* 第一次释放时刻（窗口起点） */
 
   uint8_t r = (uint8_t)BSP_PB_GetState(BUTTON_USER);
 
-  /* 复用 warmup 同步标志 */
+  /* Warmup 同步：对齐到当前物理电平，清除所有中间状态 */
   if (g_btn_sync_needed) {
     g_btn_sync_needed = 0U;
-    candidate         = 0U;
-    g_click_count     = 0U;
-    g_btn_pressing    = (r == 0U) ? 1U : 0U;
-    if (g_btn_pressing) g_btn_press_start = HAL_GetTick();
+    last   = r;
+    stable = r;
+    tick   = HAL_GetTick();
+    cstate = S_IDLE;
     return;
   }
 
-  if (!g_btn_pressing) {
-    if (r == 0U) {
-      if (!candidate) {
-        candidate      = 1U;
-        candidate_tick = HAL_GetTick();
-      } else if ((HAL_GetTick() - candidate_tick) >= BTN_DEBOUNCE_MS) {
-        g_btn_pressing    = 1U;
-        g_btn_press_start = candidate_tick;
-        candidate         = 0U;
-      }
-    } else {
-      candidate = 0U;
-    }
-  } else {
-    if (r != 0U) {                          /* 松手 */
-      uint32_t dur = HAL_GetTick() - g_btn_press_start;
-      g_btn_pressing = 0U;
-      candidate      = 0U;
-      if (dur < BTN_CLICK_MAX_MS) {         /* 有效点击 */
-        uint32_t gap = HAL_GetTick() - g_last_release;
-        /* 释放去抖：两次有效释放间隔 < 80ms 视为触点弹跳，忽略。
-           人手双击最快也要 ~150ms，80ms 足够过滤弹跳且不误杀。 */
-        if (g_click_count == 0U || gap >= 80U) {
-          g_click_count++;
-          g_last_release = HAL_GetTick();
-          if (g_click_count == 1U)      g_btn_event = BTN_SINGLE;
-          else if (g_click_count == 2U) g_btn_event = BTN_DOUBLE;
-          else                          g_btn_event = BTN_TRIPLE;
-        }
-      }
-      /* 按住超过 500ms 的不算点击，忽略 */
+  /* --- 消抖（与 version3 完全相同的逻辑） --- */
+  if (r != last) {
+    last = r;
+    tick = HAL_GetTick();
+  }
+
+  uint8_t prev_stable = stable;
+  if ((HAL_GetTick() - tick) >= BTN_DEBOUNCE_MS) {
+    if (stable != last) {
+      stable = last;
     }
   }
 
-  /* 连击窗口到期 → 清除计数器，为下一轮连击做准备 */
-  if (g_click_count > 0U &&
-      (HAL_GetTick() - g_last_release) >= MULTI_CLICK_MS) {
-    g_click_count = 0U;
+  /* 检测消抖后的边沿 */
+  uint8_t press_edge   = (prev_stable == 1U && stable == 0U);  /* 按下沿 */
+  uint8_t release_edge = (prev_stable == 0U && stable == 1U);  /* 释放沿 */
+
+  /* --- 多击状态机 --- */
+  uint32_t now = HAL_GetTick();
+
+  switch (cstate) {
+  case S_IDLE:
+    if (press_edge) {
+      press_start = now;
+      cstate = S_PRESSED;
+    }
+    break;
+
+  case S_PRESSED:
+    if (release_edge) {
+      uint32_t dur = now - press_start;
+      if (dur < BTN_CLICK_MAX_MS) {
+        /* 有效短按释放：开启双击等待窗口 */
+        first_release = now;
+        cstate = S_WAIT_2ND;
+      } else {
+        /* 长按释放：忽略，回到空闲 */
+        cstate = S_IDLE;
+      }
+    }
+    break;
+
+  case S_WAIT_2ND:
+    if (press_edge) {
+      /* 窗口内再次按下 */
+      press_start = now;
+      cstate = S_PRESSED_2ND;
+    } else if ((now - first_release) >= DBLCLICK_WINDOW_MS) {
+      /* 窗口到期：确认为单击 */
+      g_btn_event = BTN_SINGLE;
+      cstate = S_IDLE;
+    }
+    break;
+
+  case S_PRESSED_2ND:
+    if (release_edge) {
+      uint32_t dur = now - press_start;
+      if (dur < BTN_CLICK_MAX_MS &&
+          (now - first_release) < DBLCLICK_WINDOW_MS) {
+        /* 第二次有效短按释放，且仍在窗口内：双击 */
+        g_btn_event = BTN_DOUBLE;
+      } else {
+        /* 超时或长按：只算第一次的单击 */
+        g_btn_event = BTN_SINGLE;
+      }
+      cstate = S_IDLE;
+    } else if ((now - first_release) >= DBLCLICK_WINDOW_MS) {
+      /* 第二次按住期间窗口到期：算单击，第二次按下继续跟踪 */
+      g_btn_event = BTN_SINGLE;
+      /* 将第二次按下视为新的第一次按下 */
+      cstate = S_PRESSED;
+      /* press_start 已在进入 S_PRESSED_2ND 时设置，保持不变 */
+    }
+    break;
   }
 }
 
@@ -840,7 +883,6 @@ int main(void)
     static float tC   = NAN;
     static float tte_sec = NAN;
     static UiPage page = UI_SOC;
-    static UiPage prev_page = UI_SOC;   /* 翻页前记录，供双击回退 */
     static FaultType fault = FAULT_NONE;
 
     static uint32_t last_sample = 0;
@@ -854,29 +896,27 @@ int main(void)
 
     if (g_mode == MODE_NORMAL) {
       if (ev == BTN_SINGLE && fault == FAULT_NONE) {
-        /* 单击：立即翻页（~150ms 响应，无 400ms 等待窗口） */
-        prev_page = page;
+        /* 单击翻页：wait-then-decide 策略保证事件干净，无需回退 */
         page = (page == UI_TIME) ? UI_SOC : (UiPage)(page + 1);
       } else if (ev == BTN_DOUBLE && fault == FAULT_NONE) {
-        /* 双击：进入设置模式。
-           因为立即响应策略，首次松手已触发翻页（BTN_SINGLE），
-           这里需回退到翻页前的页面再检查是否可编辑。 */
-        page = prev_page;
+        /* 双击：进入设置模式（如果当前页可编辑），否则当翻页处理 */
         int idx = EditParam_FindByPage(page);
         if (idx >= 0) {
           g_edit_idx           = idx;
           g_edit_val           = *g_edit_params[idx].p_runtime;
           g_edit_last_activity = now;
           g_mode               = MODE_EDIT;
+        } else {
+          /* 不可编辑页：双击当作翻页，避免操作被静默吞掉 */
+          page = (page == UI_TIME) ? UI_SOC : (UiPage)(page + 1);
         }
-        /* 不可编辑页：回退翻页，停留在原页 */
       }
     } else {  /* MODE_EDIT */
       /* 故障发生时立即退出编辑，不保存 */
       if (fault != FAULT_NONE) {
         g_mode = MODE_NORMAL;
       } else if (ev == BTN_SINGLE) {
-        /* 单击：循环递增编辑值（原三连击功能移至单击，操作更简单） */
+        /* 单击：循环递增编辑值 */
         const EditParamDef *def = &g_edit_params[g_edit_idx];
         g_edit_val += def->step;
         if (g_edit_val > def->max_val + def->step * 0.1f)
@@ -885,13 +925,11 @@ int main(void)
         g_edit_val = roundf(g_edit_val / def->step) * def->step;
         g_edit_last_activity = now;
       } else if (ev == BTN_DOUBLE) {
-        /* 双击：保存并退出。
-           因立即响应策略，首次松手 BTN_SINGLE 已递增一次 edit_val，
-           这里回退该次递增，使双击仅执行"保存"语义。 */
+        /* 双击：保存并退出（无需回退，事件干净） */
         const EditParamDef *def = &g_edit_params[g_edit_idx];
-        g_edit_val -= def->step;
-        if (g_edit_val < def->min_val - def->step * 0.1f)
-          g_edit_val = def->max_val;
+        /* 对齐到步长网格后再保存，防止 float 累积误差 */
+        g_edit_val = roundf(g_edit_val / def->step) * def->step;
+        g_edit_val = clampf(g_edit_val, def->min_val, def->max_val);
         *def->p_runtime = g_edit_val;
         if (Flash_SaveSettings())
           Hint_Flash("Saved");
