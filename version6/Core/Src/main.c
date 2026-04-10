@@ -56,7 +56,7 @@ SSD1306 oled;
 #define MOSFET_Pin       GPIO_PIN_5
 
 /* 按键去抖参数（与 TIM6 ISR 配合） */
-#define BTN_DEBOUNCE_CNT  4U    /* 连续一致次数才确认（4×5ms=20ms） */
+/* BTN_DEBOUNCE_CNT 已移至 stm32g4xx_it.c 的 TIM6 ISR 中，此处不再需要 */
 
 /* 可选：打开此宏在 UART 上输出按键调试信息（提交时保持注释） */
 /* #define BTN_DEBUG_UART */
@@ -173,7 +173,7 @@ static UiPage    ui_page   = UI_SOC;
 static FaultType ui_fault  = FAULT_NONE;
 
 static float     app_vbus    = 0.0f;
-static float     app_ia      = 0.0f;
+static float     app_ia      = 0.0f;    /* 电流 [A]，正=放电，负=充电 */
 static float     app_tC      = 0.0f;    /* main() 中初始化为 NAN */
 static float     app_tte_sec = 0.0f;    /* main() 中初始化为 NAN */
 
@@ -393,13 +393,17 @@ static uint16_t ADC_Read_Channel(uint32_t channel)
 
   uint32_t sum = 0;
   const int N = 8;
+  int good = 0;
   for (int i = 0; i < N; i++) {
     HAL_ADC_Start(&hadc1);
-    HAL_ADC_PollForConversion(&hadc1, 50);
-    sum += (uint16_t)HAL_ADC_GetValue(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 50) == HAL_OK) {
+      sum += (uint16_t)HAL_ADC_GetValue(&hadc1);
+      good++;
+    }
     HAL_ADC_Stop(&hadc1);
   }
-  return (uint16_t)(sum / N);
+  if (good == 0) return 0;  /* 全部超时，返回 0 让 NTC 计算得到异常温度 */
+  return (uint16_t)(sum / good);
 }
 
 static float ADC_Channel_Voltage(uint32_t channel)
@@ -636,7 +640,6 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
 
   /* page 6: 页脚 */
   UI_DrawFooter();
-  SSD1306_Update(&oled);
 }
 
 static void UI_ShowSOCCurvePage(void)
@@ -644,7 +647,6 @@ static void UI_ShowSOCCurvePage(void)
   UI_DrawHeader("SOC HIST");
   UI_DrawSOCCurve();
   UI_DrawFooter();
-  SSD1306_Update(&oled);
 }
 
 static void UI_ShowTemp(float tC)
@@ -654,14 +656,15 @@ static void UI_ShowTemp(float tC)
 
   if (isnan(tC)) strcpy(l2, "--.- C");
   else {
-    int ti = (int)tC;
-    int td = (int)fabsf((tC - (float)ti) * 10.0f);
-    snprintf(l2, sizeof(l2), "%d.%d C", ti, td);
+    const char *sign = (tC < 0.0f) ? "-" : "";
+    float abs_val = fabsf(tC);
+    int ti = (int)abs_val;
+    int td = (int)((abs_val - (float)ti) * 10.0f);
+    snprintf(l2, sizeof(l2), "%s%d.%d C", sign, ti, td);
   }
 
   SSD1306_DrawString(&oled, 0, 3, l2);
   UI_DrawFooter();
-  SSD1306_Update(&oled);
 }
 
 static void UI_ShowVolt(float v)
@@ -672,14 +675,15 @@ static void UI_ShowVolt(float v)
   if (isnan(v)) {
     strcpy(l2, "---.--- V");
   } else {
-    int vi = (int)v;
-    int vd = (int)fabsf((v - (float)vi) * 1000.0f);
-    snprintf(l2, sizeof(l2), "%d.%03d V", vi, vd);
+    const char *sign = (v < 0.0f) ? "-" : "";
+    float abs_val = fabsf(v);
+    int vi = (int)abs_val;
+    int vd = (int)((abs_val - (float)vi) * 1000.0f);
+    snprintf(l2, sizeof(l2), "%s%d.%03d V", sign, vi, vd);
   }
 
   SSD1306_DrawString(&oled, 0, 3, l2);
   UI_DrawFooter();
-  SSD1306_Update(&oled);
 }
 
 static void UI_ShowCurr(float ia)
@@ -691,14 +695,15 @@ static void UI_ShowCurr(float ia)
     strcpy(l2, "---.- mA");
   } else {
     float mA = ia * 1000.0f;
-    int mi = (int)mA;
-    int md = (int)fabsf((mA - (float)mi) * 10.0f);
-    snprintf(l2, sizeof(l2), "%d.%d mA", mi, md);
+    const char *sign = (mA < 0.0f) ? "-" : "";
+    float abs_mA = fabsf(mA);
+    int mi = (int)abs_mA;
+    int md = (int)((abs_mA - (float)mi) * 10.0f);
+    snprintf(l2, sizeof(l2), "%s%d.%d mA", sign, mi, md);
   }
 
   SSD1306_DrawString(&oled, 0, 3, l2);
   UI_DrawFooter();
-  SSD1306_Update(&oled);
 }
 
 static float RT_UpdateAndCompute_TTE_sec(float vbus, float ia_abs, float soc_now)
@@ -746,12 +751,11 @@ static void UI_ShowTime(float tte_sec)
 
   SSD1306_DrawString(&oled, 0, 3, l2);
   UI_DrawFooter();
-  SSD1306_Update(&oled);
 }
 
 /* F2: 编辑模式值显示覆盖层
- * 在正常页面绘制完成后（SSD1306_Update 已调用），覆盖 page 4 (y32) 显示编辑值，
- * 然后再次 SSD1306_Update。
+ * 在正常页面绘制完成后，覆盖 page 4 (y32) 显示编辑值。
+ * SSD1306_Update 由 Display_Update 统一调用。
  * 格式：TEMP -> "[30 C]"  CURR -> "[400 mA]"  SOC -> "[30%]"
  */
 static void UI_ShowEditOverlay(UiPage pg, float val)
@@ -773,7 +777,6 @@ static void UI_ShowEditOverlay(UiPage pg, float val)
 
   /* 在 page 4 (y32-39) 显示编辑值 */
   SSD1306_DrawString(&oled, 0, 4, buf);
-  SSD1306_Update(&oled);
 }
 
 static void UI_ShowFault(FaultType f)
@@ -783,7 +786,6 @@ static void UI_ShowFault(FaultType f)
   else if (f == FAULT_WRONG_LOAD) SSD1306_DrawString(&oled, 0, 3, "WRONG LOAD");
   else SSD1306_DrawString(&oled, 0, 3, "UNKNOWN");
   SSD1306_DrawString(&oled, 0, 6, "RESET to clear");
-  SSD1306_Update(&oled);
 }
 
 /* ===== 开机预热 ===== */
@@ -794,7 +796,7 @@ static void UI_ShowFault(FaultType f)
 static void UI_ShowWarmup(int step, int total)
 {
   SSD1306_Clear(&oled);
-  SSD1306_DrawString(&oled, 16, 0, "BMS  v4.0");
+  SSD1306_DrawString(&oled, 16, 0, "BMS  v6.0");
   SSD1306_DrawString(&oled, 4,  2, "Sensor warming");
 
   /* 进度条外框（像素坐标：y=33-38，x=4-123） */
@@ -910,7 +912,8 @@ static void Sensor_Update(uint32_t now)
     /* 过流/欠流故障检测（依赖 INA228） */
     if (sys_state != SYS_FAULT) {
       float absI = fabsf(app_ia);
-      uint8_t load_bad = (absI > g_overcurrent_a || absI < I_UNDERCURRENT_A) ? 1 : 0;
+      uint8_t mosfet_on = (HAL_GPIO_ReadPin(MOSFET_GPIO_Port, MOSFET_Pin) == GPIO_PIN_SET);
+      uint8_t load_bad = (absI > g_overcurrent_a || (mosfet_on && absI < I_UNDERCURRENT_A)) ? 1 : 0;
 
       if (load_bad) {
         bad_load_ms += dt;
@@ -1018,6 +1021,7 @@ static void Display_Update(uint32_t now)
 
   if (sys_state == SYS_FAULT) {
     UI_ShowFault(ui_fault);
+    SSD1306_Update(&oled);
     return;
   }
 
@@ -1039,8 +1043,10 @@ static void Display_Update(uint32_t now)
   /* 低电量全局警告（仅普通模式） */
   if (soc_low && sys_state == SYS_NORMAL) {
     SSD1306_DrawString(&oled, 0, 5, "SOC TOO LOW");
-    SSD1306_Update(&oled);
   }
+
+  /* 统一刷新：所有绘制完成后仅调用一次 SSD1306_Update */
+  SSD1306_Update(&oled);
 }
 
 /* ========================================================= */
@@ -1290,6 +1296,9 @@ static void MX_TIM6_Init(void)
 
 void Error_Handler(void)
 {
+  __disable_irq();
+  HAL_GPIO_WritePin(MOSFET_GPIO_Port, MOSFET_Pin, GPIO_PIN_RESET);
+  while (1) { }
 }
 
 #ifdef USE_FULL_ASSERT
