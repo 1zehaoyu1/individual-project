@@ -60,9 +60,11 @@
 /* USER CODE BEGIN EV */
 extern TIM_HandleTypeDef htim6;
 
-/* v6: TIM6 ISR → 主循环 的按键边沿标志 */
-volatile uint8_t g_btn_press_edge   = 0;
-volatile uint8_t g_btn_release_edge = 0;
+/* v6: TIM6 ISR → 主循环 的按键边沿标志
+ * 这些变量在 TIM6_DAC_IRQHandler ISR 中置位，在 main.c 的 Button_Update() 中读取并清除
+ * 声明为 volatile 确保 ISR 和主循环之间的可见性（防止编译器优化缓存） */
+volatile uint8_t g_btn_press_edge   = 0;   /* 1 = 检测到按下边沿（从松开变为按下，去抖后确认） */
+volatile uint8_t g_btn_release_edge = 0;   /* 1 = 检测到松开边沿（从按下变为松开，去抖后确认） */
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -220,41 +222,65 @@ void EXTI15_10_IRQHandler(void)
 /* USER CODE BEGIN 1 */
 
 /**
-  * @brief  TIM6 interrupt handler — 5ms 按键采样 + 计数式去抖 + 边沿检测
+  * @brief  TIM6 中断处理函数 — 5ms 按键采样 + 计数式去抖 + 边沿检测
   *
-  * 每 5ms 触发一次，读取 B1 GPIO 电平，用计数式去抖（4×5ms=20ms）
-  * 确认稳定状态变化后设置 press/release 边沿标志供主循环消费。
+  * 【触发频率】每 5ms 触发一次（TIM6 配置：170MHz/17000/50 = 200Hz）
   *
-  * ISR 执行时间约 ~1µs @ 170MHz，远低于 5ms 周期。
+  * 【算法说明】
+  *   1. 读取 B1 按钮 GPIO 电平（active-HIGH，板载 PULLDOWN）
+  *   2. 计数式去抖：当前读数与去抖后状态不同时递增计数器
+  *      连续 4 次读数一致（4 × 5ms = 20ms）才确认状态变化
+  *      这比简单的延时去抖更可靠，且不阻塞 ISR
+  *   3. 边沿检测：比较前后两次去抖后状态，检测 0→1（按下）或 1→0（松开）
+  *   4. 设置 volatile 标志供主循环 Button_Update() 消费
+  *
+  * 【性能】ISR 执行时间约 ~1µs @ 170MHz，远低于 5ms 周期
+  *
+  * 【ISR 设计原则】
+  *   - 只设置 volatile uint8_t 标志，不调用 HAL 阻塞函数
+  *   - 不做浮点运算
+  *   - 不调用 printf/sprintf
+  *   - 具体的事件判定（单击/双击/长按）留给主循环
   */
 void TIM6_DAC_IRQHandler(void)
 {
+  /* 检查是否为 TIM6 更新中断 */
   if (__HAL_TIM_GET_FLAG(&htim6, TIM_FLAG_UPDATE) == RESET) return;
   __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
 
-  /* --- 计数式去抖（与 v5 算法完全一致） --- */
+  /* --- 计数式去抖算法 ---
+   * debounce_cnt：连续读数与当前稳定状态不同的次数
+   * stable：去抖后的稳定状态（0=松开, 1=按下）
+   * prev_stable：上一次的稳定状态（用于边沿检测）
+   * 所有变量为 static，跨 ISR 调用保持 */
   static uint8_t debounce_cnt = 0;
   static uint8_t stable       = 0;   /* 0=released, 1=pressed（去抖后） */
   static uint8_t prev_stable  = 0;
 
-  /* 读 GPIO：NUCLEO-G491RE B1 active-HIGH (PULLDOWN) */
+  /* 读取 GPIO：NUCLEO-G491RE B1 按钮 active-HIGH（板载下拉电阻） */
   uint8_t raw = (BSP_PB_GetState(BUTTON_USER) != 0) ? 1 : 0;
 
   if (raw == stable) {
+    /* 读数与当前稳定状态一致：重置计数器 */
     debounce_cnt = 0;
   } else {
+    /* 读数与当前稳定状态不同：递增计数器 */
     debounce_cnt++;
-    if (debounce_cnt >= 4) {     /* 4 × 5ms = 20ms 确认 */
-      stable       = raw;
-      debounce_cnt = 0;
+    if (debounce_cnt >= 4) {     /* 4 × 5ms = 20ms 连续不同 → 确认状态变化 */
+      stable       = raw;        /* 更新稳定状态 */
+      debounce_cnt = 0;          /* 重置计数器 */
     }
   }
 
-  /* --- 边沿检测 --- */
-  uint8_t press   = (!prev_stable && stable);
-  uint8_t release = ( prev_stable && !stable);
-  prev_stable = stable;
+  /* --- 边沿检测 ---
+   * press_edge:   前次松开 → 本次按下（0→1 上升沿）
+   * release_edge: 前次按下 → 本次松开（1→0 下降沿）
+   * 标志不会被 ISR 连续置位（stable 变化后 prev_stable 同步更新） */
+  uint8_t press   = (!prev_stable && stable);    /* 上升沿：松开 → 按下 */
+  uint8_t release = ( prev_stable && !stable);   /* 下降沿：按下 → 松开 */
+  prev_stable = stable;                          /* 更新前次状态 */
 
+  /* 设置边沿标志（主循环 Button_Update() 中原子读取并清除） */
   if (press)   g_btn_press_edge   = 1;
   if (release) g_btn_release_edge = 1;
 }
