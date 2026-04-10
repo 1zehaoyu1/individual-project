@@ -13,7 +13,9 @@ ADC_HandleTypeDef hadc1;
 I2C_HandleTypeDef hi2c2;
 I2C_HandleTypeDef hi2c3;
 
-TIM_HandleTypeDef htim6;   /* v6: 按键扫描定时器 */
+/* USER CODE BEGIN 2 */
+TIM_HandleTypeDef htim6;   /* v6: 按键扫描定时器（CubeIDE 生成后由 .ioc 管理） */
+/* USER CODE END 2 */
 
 SSD1306 oled;
 
@@ -187,7 +189,9 @@ static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_I2C3_Init(void);
+/* USER CODE BEGIN 3 */
 static void MX_TIM6_Init(void);
+/* USER CODE END 3 */
 
 /* clampf 前向声明（Flash_LoadSettings 使用） */
 static float clampf(float v, float lo, float hi);
@@ -1262,25 +1266,23 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(MOSFET_GPIO_Port, &GPIO_InitStruct);
 }
 
-/* ===== v6: TIM6 初始化 — 5ms 周期中断用于按键采样 ===== */
+/* ===== MX_TIM6_Init 由 CubeIDE 根据 .ioc 自动生成 ===== */
+/* 如果 CubeIDE 已生成该函数，删除下方手写版本，保留 CubeIDE 生成的即可 */
 static void MX_TIM6_Init(void)
 {
   __HAL_RCC_TIM6_CLK_ENABLE();
 
   htim6.Instance = TIM6;
-  /* APB1 timer clock = 170 MHz (HCLK = SYSCLK = 170 MHz, APB1 prescaler = 1) */
-  htim6.Init.Prescaler   = 17000 - 1;  /* 170 MHz / 17000 = 10 kHz */
-  htim6.Init.Period       = 50 - 1;    /* 10 kHz / 50 = 200 Hz → 5 ms */
+  htim6.Init.Prescaler   = 16999;     /* 170 MHz / 17000 = 10 kHz */
+  htim6.Init.Period       = 49;       /* 10 kHz / 50 = 200 Hz → 5 ms */
   htim6.Init.CounterMode  = TIM_COUNTERMODE_UP;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
     Error_Handler();
   }
 
-  /* 优先级低于 SysTick（=15），但高于应用逻辑即可 */
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
-  /* 注意：不在此处 HAL_TIM_Base_Start_IT，预热结束后再启动 */
 }
 
 void Error_Handler(void)
