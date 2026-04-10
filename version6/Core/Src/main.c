@@ -254,8 +254,8 @@ static uint32_t stats_last_save_tick  = 0;          /* 上次 Flash 保存的 ti
 static uint32_t stats_runtime_accum_ms = 0;         /* 运行时间毫秒累计器（达 1000ms 时进位到 _s） */
 static uint8_t  stats_fault_was_active = 0;         /* 故障边沿检测：上一轮是否处于故障状态 */
 
-/* F6 三击检测状态 */
-static uint8_t  triple_click_count    = 0;          /* 连续单击计数 */
+/* F6 三击检测状态（计数物理按压：SINGLE=1, DOUBLE=2） */
+static uint8_t  triple_click_count    = 0;          /* 累计物理按压次数 */
 static uint32_t triple_click_first_tick = 0;        /* 第一次单击的 tick */
 #define TRIPLE_CLICK_WINDOW_MS  3000U               /* 三击总窗口：3 秒 */
 #define TRIPLE_CLICK_REQUIRED   3U                  /* 需要 3 次有效单击 */
@@ -1410,7 +1410,7 @@ static void UI_ShowStats2(void)
   }
   SSD1306_DrawString(&oled, 0, 5, line);
 
-  SSD1306_DrawString(&oled, 0, 7, "S:page 3x:clear");
+  SSD1306_DrawString(&oled, 0, 7, "3x press:clear");
 }
 
 /**
@@ -1792,13 +1792,17 @@ static void UI_ProcessEvent(BtnEvent evt, uint32_t now)
 
   switch (sys_state) {
   case SYS_NORMAL:
-    if (evt == BTN_EVENT_SINGLE) {
-      /* F6-2 三击检测：仅在 UI_STATS2 页面计数 BTN_EVENT_SINGLE */
+    if (evt == BTN_EVENT_SINGLE || evt == BTN_EVENT_DOUBLE) {
+      /* F6-2 三击检测：在 UI_STATS2 页面按物理按压次数计数
+       * 根因：Button_Update() 的 300ms 双击窗口会把快速连按吸收成 DOUBLE，
+       * 仅计数 SINGLE 导致快速三击被识别为 DOUBLE+SINGLE（只算 1 次 SINGLE），
+       * 因此把 DOUBLE 也计入，按实际物理按压次数累加：SINGLE=1, DOUBLE=2 */
       if (ui_page == UI_STATS2) {
+        uint8_t presses = (evt == BTN_EVENT_DOUBLE) ? 2U : 1U;
         if (triple_click_count == 0) {
           triple_click_first_tick = now;
         }
-        triple_click_count++;
+        triple_click_count += presses;
         if (triple_click_count >= TRIPLE_CLICK_REQUIRED) {
           if ((now - triple_click_first_tick) <= TRIPLE_CLICK_WINDOW_MS) {
             /* 三击成功：进入清零确认 */
@@ -1807,14 +1811,14 @@ static void UI_ProcessEvent(BtnEvent evt, uint32_t now)
             triple_click_count = 0;
             break;
           }
-          /* 窗口超时：重置计数，当前这次算第一次 */
-          triple_click_count = 1;
+          /* 窗口超时：重置计数，当前这批算第一批 */
+          triple_click_count = presses;
           triple_click_first_tick = now;
         }
         /* 检查窗口是否已超时（不足 3 次但已超时） */
         if (triple_click_count > 0 &&
             (now - triple_click_first_tick) > TRIPLE_CLICK_WINDOW_MS) {
-          triple_click_count = 1;
+          triple_click_count = presses;
           triple_click_first_tick = now;
         }
         /* 三击检测中不翻页，保持在 STATS2 */
@@ -1823,22 +1827,25 @@ static void UI_ProcessEvent(BtnEvent evt, uint32_t now)
       /* 离开 STATS2 时重置三击计数 */
       triple_click_count = 0;
 
-      /* 单击：循环翻页（8 页） */
-      if (ui_page == UI_SOC)            ui_page = UI_SOC_CURVE;
-      else if (ui_page == UI_SOC_CURVE) ui_page = UI_TEMP;
-      else if (ui_page == UI_TEMP)      ui_page = UI_VOLT;
-      else if (ui_page == UI_VOLT)      ui_page = UI_CURR;
-      else if (ui_page == UI_CURR)      ui_page = UI_TIME;
-      else if (ui_page == UI_TIME)      ui_page = UI_STATS1;
-      else if (ui_page == UI_STATS1)    ui_page = UI_STATS2;
-      else                              ui_page = UI_SOC;
-    } else if (evt == BTN_EVENT_DOUBLE) {
-      /* 双击：进入设置模式（仅可编辑页面） */
-      const EditParamDef *ep = EditParam_FindByPage(ui_page);
-      if (ep != (const EditParamDef *)0) {
-        sys_state        = SYS_SETTING;
-        edit_val         = *(ep->pval);   /* 复制当前值作为编辑副本 */
-        edit_last_action = now;            /* 重置超时计时器 */
+      if (evt == BTN_EVENT_SINGLE) {
+        /* 单击：循环翻页（8 页） */
+        if (ui_page == UI_SOC)            ui_page = UI_SOC_CURVE;
+        else if (ui_page == UI_SOC_CURVE) ui_page = UI_TEMP;
+        else if (ui_page == UI_TEMP)      ui_page = UI_VOLT;
+        else if (ui_page == UI_VOLT)      ui_page = UI_CURR;
+        else if (ui_page == UI_CURR)      ui_page = UI_TIME;
+        else if (ui_page == UI_TIME)      ui_page = UI_STATS1;
+        else if (ui_page == UI_STATS1)    ui_page = UI_STATS2;
+        else                              ui_page = UI_SOC;
+      } else {
+        /* 双击：进入设置模式（仅可编辑页面）
+         * UI_STATS2 已在上方被拦截，此处只处理非 STATS2 页面 */
+        const EditParamDef *ep = EditParam_FindByPage(ui_page);
+        if (ep != (const EditParamDef *)0) {
+          sys_state        = SYS_SETTING;
+          edit_val         = *(ep->pval);   /* 复制当前值作为编辑副本 */
+          edit_last_action = now;            /* 重置超时计时器 */
+        }
       }
     }
     break;
