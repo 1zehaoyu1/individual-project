@@ -1,21 +1,22 @@
 /**
  * @file    main.c
  * @brief   基于 STM32G491RETx 的 3S 锂电池管理系统（BMS）主程序
- * @version v6.0
+ * @version v6.1
  *
  * 【功能概述】
  * 本固件运行在 NUCLEO-G491RE 开发板上，实现 3S 锂电池组（标称 11.1V，2.2Ah）的：
  *   - 电压/电流采集（INA228，I2C2）
  *   - 温度采集（NTC 热敏电阻，ADC1 CH1）
  *   - SOC 估算（OCV 初始化 + 库仑计数 + 轻量 OCV 校正）
- *   - OLED 显示（SSD1306，I2C3，6 页界面）
+ *   - OLED 显示（SSD1306，I2C3，8+1 页界面）
  *   - 负载控制（MOSFET，GPIO PB5）
  *   - 故障检测（过温 / 过流 / 欠流）
  *   - 运行时可调阈值（F2 设置模式，双击进入）
+ *   - Flash 统计数据持久化（F6 页面：启动次数/运行时间/极值/能量/故障）
  *
  * 【架构】裸机超循环（bare-metal superloop），无 RTOS
  *   TIM6 ISR (5ms) → 按键采样去抖 → volatile 边沿标志
- *   主循环：Button_Update → Sensor_Update → Control_Update → UI_ProcessEvent → Display_Update
+ *   主循环：Button_Update → Sensor_Update → Stats_Update → Control_Update → UI_ProcessEvent → Display_Update
  *
  * 【时序】
  *   - 按键扫描：5ms（TIM6 中断）
@@ -23,6 +24,7 @@
  *   - 显示刷新：250ms
  *   - SOC 历史记录：5s
  *   - 预估剩余时间（TTE）：10s 滑动窗口
+ *   - 统计数据 Flash 保存：15 分钟（仅 dirty 时）
  */
 
 #include "main.h"
@@ -103,11 +105,13 @@ typedef enum {
 #define BTN_DOUBLE_MS     300U    /* 双击间隔窗口：第一次松手后 300ms 内再次按下视为双击 */
 
 /* ===== 系统状态机 ===== */
-/* 三态状态机控制整个系统行为 */
+/* 五态状态机控制整个系统行为 */
 typedef enum {
-    SYS_NORMAL = 0,   /* 正常显示模式：单击翻页，双击进入设置 */
-    SYS_SETTING,      /* 设置模式：可编辑运行时阈值（过温/过流/SOC低电量） */
-    SYS_FAULT         /* 故障状态：显示故障信息，需硬件复位清除 */
+    SYS_NORMAL = 0,       /* 正常显示模式：单击翻页，双击进入设置 */
+    SYS_SETTING,          /* 设置模式：可编辑运行时阈值（过温/过流/SOC低电量） */
+    SYS_FAULT,            /* 故障状态：显示故障信息，需硬件复位清除 */
+    SYS_CLEAR_CONFIRM,    /* F6 清零确认页面：单击确认，4秒超时取消 */
+    SYS_CLEAR_DONE        /* F6 清零完成提示：显示 1 秒后返回 */
 } SysState;
 
 /* ===== 编辑超时 ===== */
@@ -115,8 +119,8 @@ typedef enum {
 #define EDIT_TIMEOUT_MS  10000U
 
 /* ===== UI 页面枚举 ===== */
-/* 6 页循环显示，单击翻页顺序：SOC → SOC历史 → TEMP → VOLT → CURR → TIME → SOC */
-typedef enum { UI_SOC = 0, UI_SOC_CURVE, UI_TEMP, UI_VOLT, UI_CURR, UI_TIME } UiPage;
+/* 8 页循环显示，单击翻页顺序：SOC → SOC_CURVE → TEMP → VOLT → CURR → TIME → STATS1 → STATS2 → SOC */
+typedef enum { UI_SOC = 0, UI_SOC_CURVE, UI_TEMP, UI_VOLT, UI_CURR, UI_TIME, UI_STATS1, UI_STATS2 } UiPage;
 
 /* ===== 故障类型枚举 ===== */
 typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
@@ -185,6 +189,240 @@ static const EditParamDef *EditParam_FindByPage(UiPage pg)
     if (g_edit_params[i].page == pg) return &g_edit_params[i];
   }
   return (const EditParamDef *)0;
+}
+
+/* ===== F6: Flash 统计数据存储 ===== */
+/* 使用 STM32G491RETx Flash Page 254 (0x0807F000) 存储统计数据
+ * Page 255 已被 F2 设置模式使用 (0x0807F800)
+ * 程序代码 + 只读数据 + 初始化数据段结束地址约 0x08008D64，远低于 Page 254 */
+#define STATS_FLASH_ADDR   0x0807F000U   /* Flash Page 254 起始地址 */
+#define STATS_FLASH_PAGE   254U          /* Flash 页编号 */
+#define STATS_MAGIC        0xDEAD1234U   /* 统计数据魔数（区别于设置魔数 0xBEEFCAFE） */
+
+/* 统计数据最后故障类型编码（存储在 Flash 中的 uint32_t） */
+#define STATS_LASTFAULT_NONE  0U
+#define STATS_LASTFAULT_OT    1U   /* Over-Temperature */
+#define STATS_LASTFAULT_OC    2U   /* Over-Current / Wrong Load */
+
+/**
+ * @brief  Flash 统计数据结构体（精确 48 字节 = 6 doublewords）
+ * @note   STM32G4 Flash 编程粒度为 doubleword (8 字节)
+ *         布局：
+ *           偏移 0x00: magic           (uint32_t)  魔数
+ *           偏移 0x04: boot_count      (uint32_t)  启动次数
+ *           偏移 0x08: total_runtime_s (uint32_t)  总运行时间（秒）
+ *           偏移 0x0C: _pad0           (uint32_t)  填充
+ *           偏移 0x10: hist_max_temp   (float)     历史最高温度
+ *           偏移 0x14: total_energy_wh (float)     累计输出能量（Wh）
+ *           偏移 0x18: max_current_a   (float)     历史最大电流（A）
+ *           偏移 0x1C: max_power_w     (float)     历史最大功率（W）
+ *           偏移 0x20: fault_total     (uint32_t)  故障总次数
+ *           偏移 0x24: last_fault      (uint32_t)  最后一次故障类型
+ *           偏移 0x28: checksum        (uint32_t)  校验和
+ *           偏移 0x2C: _pad1           (uint32_t)  填充至 48 字节
+ */
+typedef struct {
+  uint32_t magic;           /* 0x00 */
+  uint32_t boot_count;      /* 0x04 */
+  uint32_t total_runtime_s; /* 0x08 */
+  uint32_t _pad0;           /* 0x0C */
+  float    hist_max_temp;   /* 0x10 */
+  float    total_energy_wh; /* 0x14 */
+  float    max_current_a;   /* 0x18 */
+  float    max_power_w;     /* 0x1C */
+  uint32_t fault_total;     /* 0x20 */
+  uint32_t last_fault;      /* 0x24 */
+  uint32_t checksum;        /* 0x28 */
+  uint32_t _pad1;           /* 0x2C */
+} StatsFlash;
+
+/* 编译期校验结构体大小（必须 = 48 字节 = 6 doublewords） */
+_Static_assert(sizeof(StatsFlash) == 48, "StatsFlash must be exactly 48 bytes");
+
+/* ===== F6: RAM 统计变量（运行时更新，低频写入 Flash） ===== */
+static uint32_t stats_boot_count      = 0;
+static uint32_t stats_total_runtime_s = 0;
+static float    stats_hist_max_temp   = -100.0f;   /* 哨兵值：清零后 / 首次启动 */
+static float    stats_total_energy_wh = 0.0f;
+static float    stats_max_current_a   = 0.0f;
+static float    stats_max_power_w     = 0.0f;
+static uint32_t stats_fault_total     = 0;
+static uint32_t stats_last_fault      = STATS_LASTFAULT_NONE;
+
+static uint8_t  stats_dirty           = 0;         /* 1 = RAM 有未写入 Flash 的变更 */
+static uint32_t stats_last_save_tick  = 0;          /* 上次 Flash 保存的 tick */
+static uint32_t stats_runtime_accum_ms = 0;         /* 运行时间毫秒累计器（达 1000ms 时进位到 _s） */
+static uint8_t  stats_fault_was_active = 0;         /* 故障边沿检测：上一轮是否处于故障状态 */
+
+/* F6 三击检测状态 */
+static uint8_t  triple_click_count    = 0;          /* 连续单击计数 */
+static uint32_t triple_click_first_tick = 0;        /* 第一次单击的 tick */
+#define TRIPLE_CLICK_WINDOW_MS  3000U               /* 三击总窗口：3 秒 */
+#define TRIPLE_CLICK_REQUIRED   3U                  /* 需要 3 次有效单击 */
+
+/* F6 清零确认/完成状态 */
+static uint32_t clear_confirm_tick    = 0;          /* 进入确认页的 tick */
+static uint32_t clear_done_tick       = 0;          /* 进入完成页的 tick */
+static uint32_t btn_lock_until        = 0;          /* 按键锁定截止 tick（清零后 800ms） */
+#define CLEAR_CONFIRM_TIMEOUT_MS 4000U              /* 确认页超时：4 秒 */
+#define CLEAR_DONE_DISPLAY_MS    1000U              /* 完成提示显示：1 秒 */
+#define CLEAR_BTN_LOCK_MS        800U               /* 清零后按键锁定：800ms */
+
+/* Flash 统计保存周期：15 分钟 */
+#define STATS_SAVE_INTERVAL_MS   (15U * 60U * 1000U)
+
+/**
+ * @brief  计算 StatsFlash 校验和（覆盖 magic 和 _pad1 之间的所有字段）
+ * @param  s  指向 StatsFlash 的指针
+ * @return 校验和（所有 uint32_t 字段 + float 位模式的异或）
+ */
+static uint32_t Stats_Checksum(const StatsFlash *s)
+{
+  uint32_t cs = 0;
+  cs ^= s->boot_count;
+  cs ^= s->total_runtime_s;
+  /* float 字段用 memcpy 提取位模式，避免 strict-aliasing 违规 */
+  uint32_t tmp;
+  memcpy(&tmp, &s->hist_max_temp,   sizeof(uint32_t)); cs ^= tmp;
+  memcpy(&tmp, &s->total_energy_wh, sizeof(uint32_t)); cs ^= tmp;
+  memcpy(&tmp, &s->max_current_a,   sizeof(uint32_t)); cs ^= tmp;
+  memcpy(&tmp, &s->max_power_w,     sizeof(uint32_t)); cs ^= tmp;
+  cs ^= s->fault_total;
+  cs ^= s->last_fault;
+  return cs;
+}
+
+/**
+ * @brief  从 Flash 加载统计数据到 RAM
+ * @note   在 main() 初始化阶段调用。如果 Flash 未写入或校验失败，保持默认值。
+ */
+static void Stats_LoadFromFlash(void)
+{
+  const volatile StatsFlash *p =
+      (const volatile StatsFlash *)STATS_FLASH_ADDR;
+
+  if (p->magic != STATS_MAGIC) return;   /* 未初始化 */
+
+  /* 构造本地副本用于校验（从 volatile 逐字段拷贝） */
+  StatsFlash local;
+  local.magic           = p->magic;
+  local.boot_count      = p->boot_count;
+  local.total_runtime_s = p->total_runtime_s;
+  local._pad0           = p->_pad0;
+  local.hist_max_temp   = p->hist_max_temp;
+  local.total_energy_wh = p->total_energy_wh;
+  local.max_current_a   = p->max_current_a;
+  local.max_power_w     = p->max_power_w;
+  local.fault_total     = p->fault_total;
+  local.last_fault      = p->last_fault;
+  local.checksum        = p->checksum;
+  local._pad1           = p->_pad1;
+
+  if (local.checksum != Stats_Checksum(&local)) return;  /* 校验失败 */
+
+  /* 加载到 RAM */
+  stats_boot_count      = local.boot_count;
+  stats_total_runtime_s = local.total_runtime_s;
+  stats_hist_max_temp   = local.hist_max_temp;
+  stats_total_energy_wh = local.total_energy_wh;
+  stats_max_current_a   = local.max_current_a;
+  stats_max_power_w     = local.max_power_w;
+  stats_fault_total     = local.fault_total;
+  stats_last_fault      = local.last_fault;
+
+  /* 防御性检查：NaN 替换为安全值 */
+  if (isnan(stats_hist_max_temp))   stats_hist_max_temp   = -100.0f;
+  if (isnan(stats_total_energy_wh)) stats_total_energy_wh = 0.0f;
+  if (isnan(stats_max_current_a))   stats_max_current_a   = 0.0f;
+  if (isnan(stats_max_power_w))     stats_max_power_w     = 0.0f;
+}
+
+/**
+ * @brief  将 RAM 统计数据保存到 Flash
+ * @return 1=成功，0=失败
+ * @note   写入后 readback 验证
+ */
+static uint8_t Stats_SaveToFlash(void)
+{
+  /* 1. 构造写入数据 */
+  StatsFlash s;
+  s.magic           = STATS_MAGIC;
+  s.boot_count      = stats_boot_count;
+  s.total_runtime_s = stats_total_runtime_s;
+  s._pad0           = 0xFFFFFFFFU;
+  s.hist_max_temp   = stats_hist_max_temp;
+  s.total_energy_wh = stats_total_energy_wh;
+  s.max_current_a   = stats_max_current_a;
+  s.max_power_w     = stats_max_power_w;
+  s.fault_total     = stats_fault_total;
+  s.last_fault      = stats_last_fault;
+  s.checksum        = Stats_Checksum(&s);
+  s._pad1           = 0xFFFFFFFFU;
+
+  /* 2. 解锁 Flash */
+  if (HAL_FLASH_Unlock() != HAL_OK) return 0;
+
+  /* 3. 擦除 Page 254 */
+  FLASH_EraseInitTypeDef erase;
+  uint32_t page_error = 0;
+  erase.TypeErase = FLASH_TYPEERASE_PAGES;
+  erase.Banks     = FLASH_BANK_1;
+  erase.Page      = STATS_FLASH_PAGE;
+  erase.NbPages   = 1;
+
+  if (HAL_FLASHEx_Erase(&erase, &page_error) != HAL_OK) {
+    HAL_FLASH_Lock();
+    return 0;
+  }
+
+  /* 4. 逐 doubleword 写入（48 字节 = 6 doublewords） */
+  uint32_t addr = STATS_FLASH_ADDR;
+  uint8_t ok = 1;
+  const uint8_t *raw = (const uint8_t *)&s;
+
+  for (int i = 0; i < 6; i++) {
+    uint64_t dw;
+    memcpy(&dw, raw + (uint32_t)i * 8U, 8U);
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                          addr, dw) != HAL_OK) {
+      ok = 0;
+      break;
+    }
+    addr += 8U;
+  }
+
+  HAL_FLASH_Lock();
+
+  /* 5. Readback 验证 */
+  if (ok) {
+    const volatile StatsFlash *rb =
+        (const volatile StatsFlash *)STATS_FLASH_ADDR;
+    if (rb->magic != STATS_MAGIC || rb->checksum != s.checksum) {
+      ok = 0;
+    }
+  }
+
+  if (ok) stats_dirty = 0;
+  return ok;
+}
+
+/**
+ * @brief  清零统计数据（保留 boot_count）并立即写入 Flash
+ * @return 1=成功，0=失败
+ */
+static uint8_t Stats_ClearAndSave(void)
+{
+  /* 保留 boot_count，清零其余 */
+  stats_total_runtime_s = 0;
+  stats_hist_max_temp   = -100.0f;   /* 哨兵值 */
+  stats_total_energy_wh = 0.0f;
+  stats_max_current_a   = 0.0f;
+  stats_max_power_w     = 0.0f;
+  stats_fault_total     = 0;
+  stats_last_fault      = STATS_LASTFAULT_NONE;
+  stats_runtime_accum_ms = 0;
+
+  return Stats_SaveToFlash();
 }
 
 /* ===== F5: SOC 历史采样（用于曲线图显示） ===== */
@@ -882,10 +1120,6 @@ static void UI_ShowSOC(int soc_percent, uint8_t soc_low)
   if (soc_low) blink_phase ^= 1u;
   else         blink_phase  = 0u;
 
-  /* 翻转闪烁相位：放在绘制之后，确保低电量首帧填充条可见 */
-  if (soc_low) blink_phase ^= 1u;   /* 低电量：交替翻转 */
-  else         blink_phase  = 0u;    /* 正常：始终显示 */
-
   /* page 2: 百分比文字，与电池图标同行（x=92 在图标右侧） */
   snprintf(txt, sizeof(txt), "%d%%", soc_percent);
   SSD1306_DrawString(&oled, 92, 2, txt);
@@ -1084,6 +1318,124 @@ static void UI_ShowEditOverlay(UiPage pg, float val)
   SSD1306_DrawString(&oled, 0, 4, buf);
 }
 
+/* ===== F6: 统计页面绘制 ===== */
+
+/**
+ * @brief  绘制 F6-1 核心统计页面
+ * @note   显示格式：
+ *         FLASH STATS
+ *         BOOT : 13
+ *         RUN  : 05h42m
+ *         TMAX : 32.8C
+ *         ENER : 1.84Wh
+ */
+static void UI_ShowStats1(void)
+{
+  char line[22];
+  UI_DrawHeader("FLASH STATS");
+
+  /* BOOT 次数 */
+  snprintf(line, sizeof(line), "BOOT : %lu", (unsigned long)stats_boot_count);
+  SSD1306_DrawString(&oled, 0, 2, line);
+
+  /* 运行时间：HHhMMm 格式 */
+  uint32_t hrs = stats_total_runtime_s / 3600U;
+  uint32_t mns = (stats_total_runtime_s % 3600U) / 60U;
+  snprintf(line, sizeof(line), "RUN  : %02luh%02lum",
+           (unsigned long)hrs, (unsigned long)mns);
+  SSD1306_DrawString(&oled, 0, 3, line);
+
+  /* 历史最高温度 */
+  if (stats_hist_max_temp <= -99.0f) {
+    snprintf(line, sizeof(line), "TMAX : --.-C");
+  } else {
+    int ti = (int)fabsf(stats_hist_max_temp);
+    int td = (int)((fabsf(stats_hist_max_temp) - (float)ti) * 10.0f);
+    const char *sign = (stats_hist_max_temp < 0.0f) ? "-" : "";
+    snprintf(line, sizeof(line), "TMAX : %s%d.%dC", sign, ti, td);
+  }
+  SSD1306_DrawString(&oled, 0, 4, line);
+
+  /* 累计能量 */
+  {
+    int ei = (int)stats_total_energy_wh;
+    int ed = (int)((stats_total_energy_wh - (float)ei) * 100.0f);
+    snprintf(line, sizeof(line), "ENER : %d.%02dWh", ei, ed);
+  }
+  SSD1306_DrawString(&oled, 0, 5, line);
+
+  UI_DrawFooter();
+}
+
+/**
+ * @brief  绘制 F6-2 详细统计页面
+ * @note   显示格式：
+ *         DETAIL STATS
+ *         IMAX : 1.28A
+ *         PMAX : 14.6W
+ *         FTOT : 4
+ *         LAST : OC
+ */
+static void UI_ShowStats2(void)
+{
+  char line[22];
+  UI_DrawHeader("DETAIL STATS");
+
+  /* 最大电流 */
+  {
+    int ii = (int)(stats_max_current_a);
+    int id = (int)((stats_max_current_a - (float)ii) * 100.0f);
+    snprintf(line, sizeof(line), "IMAX : %d.%02dA", ii, id);
+  }
+  SSD1306_DrawString(&oled, 0, 2, line);
+
+  /* 最大功率 */
+  {
+    int pi_val = (int)stats_max_power_w;
+    int pd = (int)((stats_max_power_w - (float)pi_val) * 10.0f);
+    snprintf(line, sizeof(line), "PMAX : %d.%dW", pi_val, pd);
+  }
+  SSD1306_DrawString(&oled, 0, 3, line);
+
+  /* 故障总次数 */
+  snprintf(line, sizeof(line), "FTOT : %lu", (unsigned long)stats_fault_total);
+  SSD1306_DrawString(&oled, 0, 4, line);
+
+  /* 最后故障类型 */
+  {
+    const char *ft_str = "NONE";
+    if (stats_last_fault == STATS_LASTFAULT_OT) ft_str = "OT";
+    else if (stats_last_fault == STATS_LASTFAULT_OC) ft_str = "OC";
+    snprintf(line, sizeof(line), "LAST : %s", ft_str);
+  }
+  SSD1306_DrawString(&oled, 0, 5, line);
+
+  SSD1306_DrawString(&oled, 0, 7, "S:page 3x:clear");
+}
+
+/**
+ * @brief  绘制 F6-C 清零确认页面
+ * @note   显示格式：
+ *         CLEAR STATS?
+ *         Press : YES
+ *         Wait  : NO
+ */
+static void UI_ShowClearConfirm(void)
+{
+  UI_DrawHeader("CLEAR STATS?");
+  SSD1306_DrawString(&oled, 0, 3, "Press : YES");
+  SSD1306_DrawString(&oled, 0, 4, "Wait  : NO");
+}
+
+/**
+ * @brief  绘制清零完成提示页面
+ */
+static void UI_ShowClearDone(void)
+{
+  SSD1306_Clear(&oled);
+  SSD1306_DrawString(&oled, 12, 3, "STATS CLEARED");
+}
+
 /**
  * @brief  绘制故障页面（SYS_FAULT 状态下独占显示）
  * @param  f  故障类型
@@ -1170,6 +1522,79 @@ static void Warmup_Phase(void)
     soc_inited = 1;
   }
   /* valid_cnt==0：soc_inited 保持 0，主循环第一次成功采样时兜底 OCV 初始化 */
+}
+
+/* ===== F6: 运行时统计更新 ===== */
+
+/**
+ * @brief  运行时统计更新（在 Sensor_Update 内部调用，每 200ms）
+ * @param  now  当前 tick
+ * @param  dt   实际采样间隔（ms）
+ * @note   必须在全局变量（sys_state, app_tC, app_ia, app_vbus, ui_fault）
+ *         更新之后调用，因此嵌入在 Sensor_Update 尾部
+ */
+static void Stats_Update(uint32_t now, uint32_t dt)
+{
+  /* 运行时间累计（仅 SYS_NORMAL 状态） */
+  if (sys_state == SYS_NORMAL) {
+    stats_runtime_accum_ms += dt;
+    while (stats_runtime_accum_ms >= 1000U) {
+      stats_runtime_accum_ms -= 1000U;
+      stats_total_runtime_s++;
+      stats_dirty = 1;
+    }
+  }
+
+  /* 极值追踪：温度 */
+  if (!isnan(app_tC) && app_tC > stats_hist_max_temp) {
+    stats_hist_max_temp = app_tC;
+    stats_dirty = 1;
+  }
+
+  /* 极值追踪：电流 */
+  if (!isnan(app_ia)) {
+    float abs_ia = fabsf(app_ia);
+    if (abs_ia > stats_max_current_a) {
+      stats_max_current_a = abs_ia;
+      stats_dirty = 1;
+    }
+    /* 极值追踪：功率 */
+    if (!isnan(app_vbus)) {
+      float pw = app_vbus * abs_ia;
+      if (pw > stats_max_power_w) {
+        stats_max_power_w = pw;
+        stats_dirty = 1;
+      }
+    }
+  }
+
+  /* 累计能量（Wh）：P × dt / 3600000 */
+  if (!isnan(app_vbus) && !isnan(app_ia)) {
+    float p_w = app_vbus * fabsf(app_ia);
+    float dE  = p_w * ((float)dt / 3600000.0f);
+    if (dE > 0.0f) {
+      stats_total_energy_wh += dE;
+      stats_dirty = 1;
+    }
+  }
+
+  /* 故障计数（边沿检测：仅在 SYS_FAULT 刚进入时计数一次） */
+  if (sys_state == SYS_FAULT && !stats_fault_was_active) {
+    stats_fault_total++;
+    /* 记录故障类型 */
+    if (ui_fault == FAULT_WRONG_TEMP)      stats_last_fault = STATS_LASTFAULT_OT;
+    else if (ui_fault == FAULT_WRONG_LOAD) stats_last_fault = STATS_LASTFAULT_OC;
+    stats_dirty = 1;
+    stats_fault_was_active = 1;
+  } else if (sys_state != SYS_FAULT) {
+    stats_fault_was_active = 0;
+  }
+
+  /* 定期 Flash 保存（15 分钟，仅 dirty 时） */
+  if (stats_dirty && (now - stats_last_save_tick) >= STATS_SAVE_INTERVAL_MS) {
+    Stats_SaveToFlash();
+    stats_last_save_tick = now;
+  }
 }
 
 /* ===== 核心模块函数：传感器采样 + SOC 更新 + 故障检测 ===== */
@@ -1284,6 +1709,9 @@ static void Sensor_Update(uint32_t now)
     ui_fault  = FAULT_WRONG_TEMP;
     sys_state = SYS_FAULT;
   }
+
+  /* 9. F6 统计数据更新（运行时间/极值/能量/故障计数/定期 Flash 保存） */
+  Stats_Update(now, dt);
 }
 
 /**
@@ -1321,28 +1749,88 @@ static void Control_Update(void)
  */
 static void UI_ProcessEvent(BtnEvent evt, uint32_t now)
 {
-  /* 无事件时：仅检查设置模式超时 */
+  /* 按键锁定期间吞掉所有事件
+   * btn_lock_until 由清零完成后设置为 now + 800ms
+   * 用 (int32_t)(now - btn_lock_until) < 0 判断是否仍在锁定期
+   * 这依赖有符号差值在 ~24 天内正确（远超实际使用场景） */
+  if (evt != BTN_EVENT_NONE && (int32_t)(now - btn_lock_until) < 0) {
+    evt = BTN_EVENT_NONE;
+  }
+
+  /* 无事件时：检查各模式超时 */
   if (evt == BTN_EVENT_NONE) {
     if (sys_state == SYS_SETTING) {
       if ((now - edit_last_action) >= EDIT_TIMEOUT_MS) {
         sys_state = SYS_NORMAL;  /* 超时退出，不保存 */
       }
+    } else if (sys_state == SYS_CLEAR_CONFIRM) {
+      if ((now - clear_confirm_tick) >= CLEAR_CONFIRM_TIMEOUT_MS) {
+        sys_state = SYS_NORMAL;  /* 4 秒超时：取消清零，回 STATS2 */
+        ui_page   = UI_STATS2;
+      }
+    } else if (sys_state == SYS_CLEAR_DONE) {
+      if ((now - clear_done_tick) >= CLEAR_DONE_DISPLAY_MS) {
+        sys_state = SYS_NORMAL;
+        ui_page   = UI_STATS1;   /* 返回 F6-1 */
+        btn_lock_until = now + CLEAR_BTN_LOCK_MS;  /* 800ms 按键锁定 */
+      }
+    }
+    /* 三击窗口超时检查（SYS_NORMAL + STATS2 页面）
+     * 窗口超时且未达到 3 次：视为翻页意图，跳到下一页并重置计数 */
+    if (sys_state == SYS_NORMAL && ui_page == UI_STATS2 &&
+        triple_click_count > 0 &&
+        (now - triple_click_first_tick) > TRIPLE_CLICK_WINDOW_MS) {
+      triple_click_count = 0;
+      ui_page = UI_SOC;  /* STATS2 → SOC（循环回到首页） */
     }
     return;
   }
 
-  /* 故障状态下忽略所有按键 */
+  /* 故障优先级 > 清零交互：故障发生时强制退出确认/完成状态 */
   if (sys_state == SYS_FAULT) return;
+  if (sys_state == SYS_CLEAR_DONE) return;  /* 完成提示期间忽略按键 */
 
   switch (sys_state) {
   case SYS_NORMAL:
     if (evt == BTN_EVENT_SINGLE) {
-      /* 单击：循环翻页 */
+      /* F6-2 三击检测：仅在 UI_STATS2 页面计数 BTN_EVENT_SINGLE */
+      if (ui_page == UI_STATS2) {
+        if (triple_click_count == 0) {
+          triple_click_first_tick = now;
+        }
+        triple_click_count++;
+        if (triple_click_count >= TRIPLE_CLICK_REQUIRED) {
+          if ((now - triple_click_first_tick) <= TRIPLE_CLICK_WINDOW_MS) {
+            /* 三击成功：进入清零确认 */
+            sys_state = SYS_CLEAR_CONFIRM;
+            clear_confirm_tick = now;
+            triple_click_count = 0;
+            break;
+          }
+          /* 窗口超时：重置计数，当前这次算第一次 */
+          triple_click_count = 1;
+          triple_click_first_tick = now;
+        }
+        /* 检查窗口是否已超时（不足 3 次但已超时） */
+        if (triple_click_count > 0 &&
+            (now - triple_click_first_tick) > TRIPLE_CLICK_WINDOW_MS) {
+          triple_click_count = 1;
+          triple_click_first_tick = now;
+        }
+        /* 三击检测中不翻页，保持在 STATS2 */
+        break;
+      }
+      /* 离开 STATS2 时重置三击计数 */
+      triple_click_count = 0;
+
+      /* 单击：循环翻页（8 页） */
       if (ui_page == UI_SOC)            ui_page = UI_SOC_CURVE;
       else if (ui_page == UI_SOC_CURVE) ui_page = UI_TEMP;
       else if (ui_page == UI_TEMP)      ui_page = UI_VOLT;
       else if (ui_page == UI_VOLT)      ui_page = UI_CURR;
       else if (ui_page == UI_CURR)      ui_page = UI_TIME;
+      else if (ui_page == UI_TIME)      ui_page = UI_STATS1;
+      else if (ui_page == UI_STATS1)    ui_page = UI_STATS2;
       else                              ui_page = UI_SOC;
     } else if (evt == BTN_EVENT_DOUBLE) {
       /* 双击：进入设置模式（仅可编辑页面） */
@@ -1382,6 +1870,20 @@ static void UI_ProcessEvent(BtnEvent evt, uint32_t now)
     }
     break;
 
+  case SYS_CLEAR_CONFIRM:
+    if (evt == BTN_EVENT_SINGLE) {
+      /* 单击确认清零 */
+      Stats_ClearAndSave();
+      sys_state       = SYS_CLEAR_DONE;
+      clear_done_tick = now;
+    }
+    /* 其他事件（双击/长按）在确认页忽略，仅靠超时取消 */
+    break;
+
+  case SYS_CLEAR_DONE:
+    /* 完成提示期间忽略所有按键（已在上方 return） */
+    break;
+
   default:
     break;
   }
@@ -1402,9 +1904,23 @@ static void Display_Update(uint32_t now)
   if ((now - last_draw_tick) < 250U) return;  /* 未到刷新周期 */
   last_draw_tick = now;
 
-  /* 故障状态：独占显示故障信息 */
+  /* 故障状态：独占显示故障信息（优先级最高） */
   if (sys_state == SYS_FAULT) {
     UI_ShowFault(ui_fault);
+    SSD1306_Update(&oled);
+    return;
+  }
+
+  /* F6 清零确认页面 */
+  if (sys_state == SYS_CLEAR_CONFIRM) {
+    UI_ShowClearConfirm();
+    SSD1306_Update(&oled);
+    return;
+  }
+
+  /* F6 清零完成提示 */
+  if (sys_state == SYS_CLEAR_DONE) {
+    UI_ShowClearDone();
     SSD1306_Update(&oled);
     return;
   }
@@ -1413,13 +1929,15 @@ static void Display_Update(uint32_t now)
   int soc_percent = (int)(soc * 100.0f + 0.5f);
   uint8_t soc_low = (soc < g_soc_low_thresh) ? 1 : 0;
 
-  /* 根据当前页面绘制内容 */
+  /* 根据当前页面绘制内容（8 页） */
   if (ui_page == UI_SOC)            UI_ShowSOC(soc_percent, soc_low);
   else if (ui_page == UI_SOC_CURVE) UI_ShowSOCCurvePage();
   else if (ui_page == UI_TEMP)      UI_ShowTemp(app_tC);
   else if (ui_page == UI_VOLT)      UI_ShowVolt(app_vbus);
   else if (ui_page == UI_CURR)      UI_ShowCurr(app_ia);
-  else                              UI_ShowTime(app_tte_sec);
+  else if (ui_page == UI_TIME)      UI_ShowTime(app_tte_sec);
+  else if (ui_page == UI_STATS1)    UI_ShowStats1();
+  else if (ui_page == UI_STATS2)    UI_ShowStats2();
 
   /* 设置模式：在正常页面之上叠加编辑值覆盖层 */
   if (sys_state == SYS_SETTING) {
@@ -1450,7 +1968,8 @@ static void Display_Update(uint32_t now)
  *   8. MOSFET 初始断开（安全默认）
  *   9. INA228 初始化
  *   10. 编辑参数描述表初始化
- *   11. 可选 Flash 加载
+ *   11. 可选 Flash 加载（设置 + 统计数据）
+ *   11b. 统计数据：load → boot_count++ → save
  *   12. UART 初始化（调试输出）
  *   13. 预热阶段（~3s，OCV 初始化 SOC）
  *   14. 应用状态初始化（NAN 标记）
@@ -1506,6 +2025,11 @@ int main(void)
   Flash_LoadSettings();
 #endif
 
+  /* 11b. F6: 从 Flash 加载统计数据 → 递增 boot_count → 立即回写 */
+  Stats_LoadFromFlash();
+  stats_boot_count++;
+  Stats_SaveToFlash();
+
   /* 12. UART 串口初始化（115200-8N1，调试输出用） */
   BspCOMInit.BaudRate   = 115200;
   BspCOMInit.WordLength = COM_WORDLENGTH_8B;
@@ -1525,9 +2049,10 @@ int main(void)
 
   /* 15. 将定时基准对齐到预热结束时刻
    *   避免 first dt 包含预热阶段的 ~3 秒，导致库仑积分第一步偏大 */
-  last_sample_tick = HAL_GetTick();
-  last_draw_tick   = HAL_GetTick();
-  last_soc_hist    = HAL_GetTick();
+  last_sample_tick    = HAL_GetTick();
+  last_draw_tick      = HAL_GetTick();
+  last_soc_hist       = HAL_GetTick();
+  stats_last_save_tick = HAL_GetTick();  /* 统计 Flash 保存基准 */
 
   /* 16. 启动 TIM6 定时器中断（5ms 周期）
    *   预热结束后才启动，避免预热期间的假按键事件。
@@ -1535,13 +2060,14 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim6);
 
   /* 17. 主循环：非阻塞周期调度
-   *   每次迭代执行 5 个模块函数，各函数内部自行判断是否到达执行周期 */
+   *   每次迭代执行 5 个模块函数，各函数内部自行判断是否到达执行周期
+   *   Stats_Update 在 Sensor_Update 内部调用（共享 dt） */
   while (1)
   {
     uint32_t now = HAL_GetTick();
 
     BtnEvent evt = Button_Update(now);   /* 按键事件检测（读取 ISR 边沿标志） */
-    Sensor_Update(now);                   /* 传感器采样 + SOC 更新 + 故障检测（200ms） */
+    Sensor_Update(now);                   /* 传感器采样 + SOC + 故障 + 统计更新（200ms） */
     Control_Update();                     /* MOSFET 控制（温度保护） */
     UI_ProcessEvent(evt, now);            /* 按键事件 → 状态转移（翻页/设置/故障） */
     Display_Update(now);                  /* OLED 显示刷新（250ms） */
@@ -1550,6 +2076,45 @@ int main(void)
 
 /* ===== 以下是 CubeIDE 生成的硬件初始化函数 ===== */
 /* 这些函数由 STM32CubeMX 根据 .ioc 配置文件自动生成，一般不需要手动修改 */
+
+/**
+ * @brief  系统时钟配置（170 MHz）
+ * @note   HSI → PLL → 170 MHz SYSCLK
+ *         APB1 = APB2 = HCLK = 170 MHz
+ *         Flash Latency = 4 WS（BOOST 模式）
+ */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+    Error_Handler();
+  }
+}
 
 /**
  * @brief  ADC1 初始化（12-bit，单端，软件触发，通道 1）
