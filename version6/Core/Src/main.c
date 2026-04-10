@@ -67,7 +67,7 @@ SSD1306 oled;                     /* OLED 驱动结构体（含 128×64/8 = 1024
 
 #define INA228_CONFIG_RST      (1U << 15) /* 位15：软件复位 */
 #define INA228_CONFIG_ADCRANGE (1U << 4)  /* 位4：ADC 量程选择 */
-#define INA228_ADCRANGE_1      1          /* ADCRANGE=1 → ±163.84 mV，LSB=78.125 nV */
+#define INA228_ADCRANGE_1      1          /* ADCRANGE=1 → ±40.96 mV（高精度），LSB=78.125 nV */
 
 /* 分流电阻值（欧姆）和母线电压最小有效位 */
 #define RSHUNT_OHM             0.015f     /* 15 mΩ 分流电阻 */
@@ -672,7 +672,7 @@ static HAL_StatusTypeDef INA228_Write16(uint8_t reg, uint16_t value)
  * @note   配置流程：
  *   1. 软件复位（写 CONFIG 寄存器 RST 位）
  *   2. 等待 20ms 复位完成
- *   3. 设置 ADCRANGE=1（±163.84 mV 量程，LSB=78.125 nV）
+ *   3. 设置 ADCRANGE=1（±40.96 mV 量程，高精度，LSB=78.125 nV）
  *   4. 配置 ADC：64 次平均，1.052ms 转换时间，连续分流+母线测量模式
  *   初始化失败直接调用 Error_Handler()（不可恢复）
  */
@@ -684,7 +684,7 @@ static void INA228_Init_Simple(void)
   }
   HAL_Delay(20);  /* 等待复位完成 */
 
-  /* 步骤 2：设置 ADCRANGE=1，扩大分流电压量程到 ±163.84 mV */
+  /* 步骤 2：设置 ADCRANGE=1，缩小分流电压量程到 ±40.96 mV（提高精度 4 倍） */
   uint16_t cfg = 0;
   if (INA228_ADCRANGE_1) cfg |= INA228_CONFIG_ADCRANGE;
   if (INA228_Write16(INA228_REG_CONFIG, cfg) != HAL_OK) {
@@ -728,8 +728,8 @@ static float INA228_Vbus_V(void)
  * @note   不依赖 SHUNT_CAL 寄存器校准，直接用物理公式：
  *         I = V_shunt / R_shunt
  *         V_shunt = 读取值 × LSB（ADCRANGE=1 时 LSB = 78.125 nV）
- *         ADCRANGE=1 → LSB = 78.125 nV，量程 ±163.84 mV → 最大电流 ±10.9A
- *         ADCRANGE=0 → LSB = 312.5 nV，量程 ±655.36 mV → 最大电流 ±43.7A
+ *         ADCRANGE=0 → LSB = 312.5 nV，量程 ±163.84 mV → 最大电流 ±10.9A
+ *         ADCRANGE=1 → LSB = 78.125 nV，量程 ±40.96 mV  → 最大电流 ±2.73A
  */
 static float INA228_Current_A(void)
 {
