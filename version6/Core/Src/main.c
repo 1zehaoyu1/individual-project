@@ -425,6 +425,7 @@ static float NTC_TempC_FromDivider(float v_supply, float v_node)
 
 static float clampf(float v, float lo, float hi)
 {
+  if (isnan(v)) return lo;
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
@@ -479,11 +480,13 @@ static BtnEvent Button_Update(uint32_t now)
   static BtnInternalState state = BS_IDLE;
   static uint32_t state_tick    = 0U;
 
-  /* 读取并清除 ISR 产生的边沿标志 */
+  /* 读取并清除 ISR 产生的边沿标志（关中断防止竞态丢失事件） */
+  __disable_irq();
   uint8_t press_edge   = g_btn_press_edge;
   uint8_t release_edge = g_btn_release_edge;
-  if (press_edge)   g_btn_press_edge   = 0;
-  if (release_edge) g_btn_release_edge = 0;
+  g_btn_press_edge   = 0;
+  g_btn_release_edge = 0;
+  __enable_irq();
 
   /* --- 事件状态机 --- */
   switch (state) {
