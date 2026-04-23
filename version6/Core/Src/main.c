@@ -24,7 +24,7 @@
  *   - 显示刷新：250ms
  *   - SOC 历史记录：5s
  *   - 预估剩余时间（TTE）：10s 滑动窗口
- *   - 统计数据 Flash 保存：15 分钟（仅 dirty 时）
+ *   - 统计数据 Flash 保存：1 分钟（仅 dirty 时）
  */
 
 #include "main.h"
@@ -84,7 +84,8 @@ SSD1306 oled;                     /* OLED 驱动结构体（含 128×64/8 = 1024
 #define NTC_T0_K         298.15f          /* 参考温度（25°C = 298.15K） */
 #define NTC_RFIX_OHM     27000.0f         /* 分压电阻上拉（27kΩ） */
 #define NTC_ADC_CH       ADC_CHANNEL_1    /* ADC 通道 1（PA0） */
-#define NTC_SUPPLY_V     3.3f             /* NTC 分压供电电压 */
+/* 分压电路供电电压不再硬编码为 3.3V；
+ * 改用 g_vdda_v（通过 VREFINT 动态测量）传入 NTC_TempC_FromDivider */
 
 /* ===== MOSFET 负载控制（PB5） ===== */
 /* HIGH = 接通负载，LOW = 断开负载 */
@@ -262,8 +263,11 @@ static uint32_t btn_lock_until        = 0;          /* 按键锁定截止 tick�
 #define CLEAR_DONE_DISPLAY_MS    1000U              /* 完成提示显示：1 秒 */
 #define CLEAR_BTN_LOCK_MS        800U               /* 清零后按键锁定：800ms */
 
-/* Flash 统计保存周期：15 分钟 */
-#define STATS_SAVE_INTERVAL_MS   (15U * 60U * 1000U)
+/* Flash 统计保存周期：1 分钟
+ * 权衡：短运行场景（< 15 分钟）能保留极值/能量/运行时间，
+ *      代价是 Flash 擦写频率提高约 15 倍。
+ *      STM32G4 Flash 耐久约 10k 次，按 1 分钟/次估算 ≈ 7 天连续满脏写入 */
+#define STATS_SAVE_INTERVAL_MS   (1U * 60U * 1000U)
 
 /**
  * @brief  计算 StatsFlash 校验和（覆盖 magic 和 _pad1 之间的所有字段）
@@ -458,6 +462,11 @@ static float     app_vbus    = 0.0f;      /* 最新母线电压（V），INA228 
 static float     app_ia      = 0.0f;      /* 最新电流（A），正=放电，负=充电，经低通滤波 */
 static float     app_tC      = 0.0f;      /* 最新温度（°C），NTC 采集（main() 中初始化为 NAN） */
 static float     app_tte_sec = 0.0f;      /* 预估剩余放电时间（秒）（main() 中初始化为 NAN） */
+
+/* 实测 VDDA（通过 VREFINT 动态校准），替代硬编码 3.3V。
+ * 每次采样周期刷新一次；首次测量之前使用标称值 3.3V。
+ * NTC 分压和 ADC 参考都来自 VDDA 同一根轨，用实测值可消除电源偏差 */
+static float     g_vdda_v    = 3.3f;      /* 实测 VDDA 电压（V） */
 
 /* 设置模式临时状态 */
 static float     edit_val         = 0.0f; /* 当前正在编辑的参数值（未保存的副本） */
@@ -780,12 +789,56 @@ static uint16_t ADC_Read_Channel(uint32_t channel)
 /**
  * @brief  读取 ADC 通道电压（单位：V）
  * @param  channel  ADC 通道号
- * @return 电压值（V），范围 0.0 ~ 3.3V
+ * @return 电压值（V），范围 0.0 ~ VDDA
+ * @note   用 g_vdda_v（由 VREFINT 动态测量）替代硬编码 3.3V，
+ *         消除 VDDA 实际偏离 3.3V 带来的系统误差
  */
 static float ADC_Channel_Voltage(uint32_t channel)
 {
   uint16_t adc = ADC_Read_Channel(channel);
-  return ((float)adc / ADC_FULL_SCALE) * ADC_VDDA_V;  /* ADC 原始值 → 电压 */
+  return ((float)adc / ADC_FULL_SCALE) * g_vdda_v;
+}
+
+/**
+ * @brief  通过 VREFINT 测量实际 VDDA 电压
+ * @return 实际 VDDA 电压（V）；失败时保持上次值不变
+ * @note   STM32G4 片内 VREFINT ≈ 1.212V，出厂校准值 VREFINT_CAL 存于 0x1FFF75AA
+ *         公式：VDDA = 3.0V × VREFINT_CAL / VREFINT_ADC
+ *         VREFINT 需要较长采样时间（>= 4μs），用 247.5 cycles @ 42.5MHz ADC 时钟。
+ *         HAL_ADC_ConfigChannel 会自动使能 ADC 公共寄存器中的 VREFEN 位。
+ */
+static void ADC_UpdateVDDA(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+  sConfig.Channel      = ADC_CHANNEL_VREFINT;
+  sConfig.Rank         = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;  /* VREFINT 要求 tSTART >= 4μs */
+  sConfig.SingleDiff   = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset       = 0;
+
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) return;
+
+  /* 4 次采样取平均（VREFINT 本身稳定，不需要 8 次） */
+  uint32_t sum = 0;
+  int good = 0;
+  for (int i = 0; i < 4; i++) {
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 50) == HAL_OK) {
+      sum += HAL_ADC_GetValue(&hadc1);
+      good++;
+    }
+    HAL_ADC_Stop(&hadc1);
+  }
+  if (good == 0) return;  /* 失败保留旧值 */
+
+  uint16_t vrefint_adc = (uint16_t)(sum / good);
+  uint32_t vdda_mv = __HAL_ADC_CALC_VREFANALOG_VOLTAGE(vrefint_adc, ADC_RESOLUTION_12B);
+
+  /* 合理性钳位：VDDA 正常在 2.4~3.6V，超出视为测量异常 */
+  if (vdda_mv >= 2400U && vdda_mv <= 3600U) {
+    g_vdda_v = (float)vdda_mv / 1000.0f;
+  }
 }
 
 /**
@@ -1612,9 +1665,12 @@ static void Sensor_Update(uint32_t now)
   uint32_t dt = now - last_sample_tick;  /* 实际采样间隔（ms） */
   last_sample_tick = now;
 
-  /* 1. NTC 温度采样（ADC 本地采样，不依赖 I2C，始终执行） */
+  /* 1. NTC 温度采样（ADC 本地采样，不依赖 I2C，始终执行）
+   *    先通过 VREFINT 刷新实测 VDDA，再读 NTC 节点电压，
+   *    分压电路供电 = ADC 参考 = VDDA，传入实测值消除 VDDA 偏差 */
+  ADC_UpdateVDDA();
   float vntc = ADC_Channel_Voltage(NTC_ADC_CH);
-  app_tC = NTC_TempC_FromDivider(NTC_SUPPLY_V, vntc);
+  app_tC = NTC_TempC_FromDivider(g_vdda_v, vntc);
 
   /* 2. INA228 电压/电流采样（I2C 远程采样，可能失败） */
   float new_vbus = INA228_Vbus_V();
