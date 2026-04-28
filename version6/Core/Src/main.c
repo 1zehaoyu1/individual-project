@@ -133,7 +133,7 @@ typedef enum { FAULT_NONE = 0, FAULT_WRONG_TEMP, FAULT_WRONG_LOAD } FaultType;
 /* 过流 / 欠流阈值：400mA / 6mA */
 #define I_OVERCURRENT_A_DEFAULT    0.4f          /* 过流故障阈值默认值（运行时可调） */
 #define I_UNDERCURRENT_A     0.006f              /* 欠流故障阈值（MOSFET 接通时电流 < 6mA） */
-#define LOAD_FAULT_MS        10000U              /* 过流/欠流持续时间 > 10s 触发故障 */
+#define LOAD_FAULT_MS        5000U               /* SOC低/温度高/过流/欠流任一持续 > 5s 触发故障 */
 #define CAPACITY_AH      2.2f                    /* 电池标称容量（2.2Ah） */
 #define V_NOM_PACK_V     11.1f                   /* 3S 标称电压（3.7V × 3 = 11.1V） */
 
@@ -475,7 +475,7 @@ static uint32_t  edit_last_action = 0;    /* 上次编辑操作的时间戳（�
 /* 周期调度时间戳 */
 static uint32_t  last_sample_tick = 0;    /* 上次传感器采样的 tick */
 static uint32_t  last_draw_tick   = 0;    /* 上次显示刷新的 tick */
-static uint32_t  bad_load_ms      = 0;    /* 过流/欠流累计持续时间（ms） */
+static uint32_t  bad_load_ms      = 0;    /* SOC低/温度高/过流/欠流累计持续时间（ms） */
 
 /* ===== 函数前向声明 ===== */
 void SystemClock_Config(void);            /* 系统时钟配置（170 MHz） */
@@ -1732,18 +1732,23 @@ static void Sensor_Update(uint32_t now)
       }
     }
 
-    /* 7. 过流/欠流故障检测（依赖 INA228 电流数据）
+    /* 7. WRONG LOAD 故障检测（SOC/温度/电流任一超阈值持续 5s 触发）
+     *   SOC 低：soc_inited 后 soc < g_soc_low_thresh（默认 30%）
+     *   温度高：app_tC > g_mosfet_off_temp（默认 30°C，MOSFET 断开阈值）
      *   过流：|I| > g_overcurrent_a（默认 400mA）
      *   欠流：MOSFET 接通且 |I| < 6mA（负载异常断开）
-     *   持续超过 10s 触发 FAULT_WRONG_LOAD */
+     *   任一异常持续超过 5s 触发 FAULT_WRONG_LOAD */
     if (sys_state != SYS_FAULT) {
       float absI = fabsf(app_ia);
       uint8_t mosfet_on = (HAL_GPIO_ReadPin(MOSFET_GPIO_Port, MOSFET_Pin) == GPIO_PIN_SET);
-      uint8_t load_bad = (absI > g_overcurrent_a || (mosfet_on && absI < I_UNDERCURRENT_A)) ? 1 : 0;
+      uint8_t soc_bad  = (soc_inited && soc < g_soc_low_thresh) ? 1 : 0;
+      uint8_t temp_bad = (!isnan(app_tC) && app_tC > g_mosfet_off_temp) ? 1 : 0;
+      uint8_t curr_bad = (absI > g_overcurrent_a || (mosfet_on && absI < I_UNDERCURRENT_A)) ? 1 : 0;
+      uint8_t load_bad = soc_bad || temp_bad || curr_bad;
 
       if (load_bad) {
         bad_load_ms += dt;                   /* 累计异常持续时间 */
-        if (bad_load_ms >= LOAD_FAULT_MS) {  /* 超过 10s 阈值 */
+        if (bad_load_ms >= LOAD_FAULT_MS) {  /* 超过 5s 阈值 */
           ui_fault  = FAULT_WRONG_LOAD;
           sys_state = SYS_FAULT;
         }
