@@ -819,13 +819,19 @@ Texas Instruments, \emph{LM2596 SIMPLE SWITCHER® Power Converter 150-kHz 3-A St
 % Appendix A
 % =========================
 \clearpage
-\thispagestyle{plain}
-\section*{Appendix A: Preliminary Project Proposal and Project Plan}
-\addcontentsline{toc}{chapter}{Appendix A: Preliminary Project Proposal and Project Plan}
-\vspace{0.3cm}
-\noindent\includegraphics[width=\textwidth, page=1]{01_Preliminary_Project_Proposal.pdf}
+\includepdf[
+    pages=1,
+    fitpaper=true,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix A: Preliminary Project Proposal and Project Plan}
+        \addcontentsline{toc}{chapter}{Appendix A: Preliminary Project Proposal and Project Plan}
+    }
+]{01_Preliminary_Project_Proposal.pdf}
+
 \includepdf[
     pages=2-,
+    fitpaper=true,
     pagecommand={\thispagestyle{plain}}
 ]{01_Preliminary_Project_Proposal.pdf}
 
@@ -833,13 +839,19 @@ Texas Instruments, \emph{LM2596 SIMPLE SWITCHER® Power Converter 150-kHz 3-A St
 % Appendix B
 % =========================
 \clearpage
-\thispagestyle{plain}
-\section*{Appendix B: Risk Register}
-\addcontentsline{toc}{chapter}{Appendix B: Risk Register}
-\vspace{0.3cm}
-\noindent\includegraphics[width=\textwidth, page=1]{03_Risk_Register.pdf}
+\includepdf[
+    pages=1,
+    fitpaper=true,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix B: Risk Register}
+        \addcontentsline{toc}{chapter}{Appendix B: Risk Register}
+    }
+]{03_Risk_Register.pdf}
+
 \includepdf[
     pages=2-,
+    fitpaper=true,
     pagecommand={\thispagestyle{plain}}
 ]{03_Risk_Register.pdf}
 
@@ -847,13 +859,19 @@ Texas Instruments, \emph{LM2596 SIMPLE SWITCHER® Power Converter 150-kHz 3-A St
 % Appendix C
 % =========================
 \clearpage
-\thispagestyle{plain}
-\section*{Appendix C: Continuing Professional Development Log}
-\addcontentsline{toc}{chapter}{Appendix C: Continuing Professional Development Log}
-\vspace{0.3cm}
-\noindent\includegraphics[width=\textwidth, page=1]{04_CPD_Log.pdf}
+\includepdf[
+    pages=1,
+    fitpaper=true,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix C: Continuing Professional Development Log}
+        \addcontentsline{toc}{chapter}{Appendix C: Continuing Professional Development Log}
+    }
+]{04_CPD_Log.pdf}
+
 \includepdf[
     pages=2-,
+    fitpaper=true,
     pagecommand={\thispagestyle{plain}}
 ]{04_CPD_Log.pdf}
 
@@ -861,13 +879,19 @@ Texas Instruments, \emph{LM2596 SIMPLE SWITCHER® Power Converter 150-kHz 3-A St
 % Appendix D
 % =========================
 \clearpage
-\thispagestyle{plain}
-\section*{Appendix D: Health and Safety Risk Assessment}
-\addcontentsline{toc}{chapter}{Appendix D: Health and Safety Risk Assessment}
-\vspace{0.3cm}
-\noindent\includegraphics[width=\textwidth, page=1]{02_HS_Risk_Assessment.pdf}
+\includepdf[
+    pages=1,
+    fitpaper=true,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix D: Health and Safety Risk Assessment}
+        \addcontentsline{toc}{chapter}{Appendix D: Health and Safety Risk Assessment}
+    }
+]{02_HS_Risk_Assessment.pdf}
+
 \includepdf[
     pages=2-,
+    fitpaper=true,
     pagecommand={\thispagestyle{plain}}
 ]{02_HS_Risk_Assessment.pdf}
 
