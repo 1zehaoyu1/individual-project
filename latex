@@ -1,1 +1,913 @@
 
+% !TEX program = xelatex
+\documentclass[12pt]{report}
+
+\usepackage[a4paper,margin=2cm]{geometry}
+\usepackage{fontspec}
+\usepackage{setspace}
+\usepackage{ragged2e}
+\usepackage{titlesec}
+\usepackage{tocloft}
+\usepackage{etoolbox}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{needspace}
+\usepackage{pdfpages}
+\usepackage{hyperref}
+
+\makeatletter
+\patchcmd{\chapter}{\if@openright\cleardoublepage\else\clearpage\fi}{}{}{}
+\@addtoreset{figure}{section}
+\renewcommand{\thefigure}{\thesection.\arabic{figure}}
+\@addtoreset{table}{section}
+\renewcommand{\thetable}{\thesection.\arabic{table}}
+\makeatother
+
+\setstretch{1.5}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\AtBeginDocument{\RaggedRight\normalfont}
+\emergencystretch=3em
+\hbadness=10000
+\vbadness=10000
+
+\IfFontExistsTF{Carlito}{%
+  \setmainfont{Carlito}
+  \setsansfont{Carlito}
+}{%
+  \IfFontExistsTF{TeX Gyre Heros}{%
+    \setmainfont{TeX Gyre Heros}
+    \setsansfont{TeX Gyre Heros}
+  }{%
+    \setmainfont{Latin Modern Sans}
+    \setsansfont{Latin Modern Sans}
+  }%
+}
+
+\titleformat{\chapter}[display]
+  {\normalfont\bfseries\Large}
+  {\chaptername\ \thechapter}
+  {0.5em}
+  {}
+
+\newcolumntype{Y}{>{\RaggedRight\arraybackslash}X}
+
+\title{Low-Cost Embedded Battery Monitoring and Protection System}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+This report presents the design, implementation and validation of a low-cost embedded battery monitoring and protection demonstration platform for a 3S lithium-ion battery pack. The project addresses the need for an observable and testable BMS structure that can demonstrate core monitoring and protection principles without the complexity of an industrial-grade system. The platform is based on an STM32 NUCLEO-G491RE controller and integrates an INA228 digital power monitor for voltage and current measurement, an NTC thermistor circuit for temperature sensing, an SSD1306 OLED display, MOSFET-based load control, simplified State-of-Charge indication and Flash-based runtime statistics. The firmware uses a bare-metal superloop with timed sensor acquisition, button handling, display update, protection logic and data retention. Subsystem tests verified the voltage/current measurement, temperature conversion, OLED interface, MOSFET switching, SoC display and Flash statistics functions. The integrated system test showed that the platform could acquire battery parameters, display system status, respond to user input, detect abnormal temperature/current/load conditions and disconnect the external load through the MOSFET stage. The results confirm that the system is suitable for educational demonstration and prototype-level validation. However, it remains limited by short-duration laboratory testing and does not include cell balancing, charging control, certified safety validation, long-term reliability testing or advanced SoC/SoH estimation.
+
+\clearpage
+\tableofcontents
+\clearpage
+
+\chapter{Introduction}
+
+\section{Background and Motivation}
+
+Lithium-ion battery systems are now widely used in electric vehicles, portable electronics, and stationary energy storage systems. As these applications continue to expand, reliable battery monitoring and protection have become increasingly important [1], [3]. In a battery system, voltage, current, and temperature are the most fundamental variables because they directly indicate the electrical and thermal condition of the battery. These parameters also provide the basis for abnormal-condition detection, load control, and basic state evaluation [1], [2].
+
+A Battery Management System (BMS) is therefore a key part of a lithium-ion battery system. Its role is not only to measure battery parameters, but also to support safe and understandable system operation. However, many existing BMS products and research systems are highly integrated, complex, and application-specific [2]–[4]. Although this is suitable for commercial and industrial use, it can make the internal working process difficult to observe. For teaching, demonstration, and early-stage validation, such systems may behave like a “black box”, where students can see the input and output but cannot easily understand how sensing, decision-making, display, and protection are connected.
+
+The main motivation of this project is therefore to develop a low-cost and transparent battery monitoring and protection demonstration platform. Instead of aiming to reproduce a full industrial BMS, the project focuses on the essential functions needed to show how a basic BMS operates. These include voltage and current measurement, temperature monitoring, real-time status display, and MOSFET-based load protection. By keeping the hardware structure clear and the software behaviour observable, the system is intended to support educational use, classroom demonstration, and prototype-level validation.
+
+This project does not aim to achieve industrial-grade accuracy or complete commercial functionality. Instead, it aims to provide a clear, testable, and extendable embedded BMS demonstration platform. This direction allows the project to balance cost, functionality, and implementation simplicity while still addressing the core monitoring and protection requirements of lithium-ion battery systems.
+
+\section{Aim and Objectives}
+
+The overall aim of this project is to design, implement, and validate a low-cost embedded battery monitoring and protection demonstration platform for lithium-ion battery systems. The platform is intended to show the essential operating principles of a basic BMS in a clear and observable way, with emphasis on real-time measurement, status display, and protection control [2], [3]. Rather than pursuing the full complexity of an industrial BMS, the project focuses on the core functions required to make battery condition monitoring and abnormal-condition response understandable, testable, and suitable for educational demonstration.
+
+To achieve this aim, the following objectives are defined:
+
+\begin{enumerate}
+    \item To design and implement voltage and current measurement functions for monitoring the electrical condition of the battery system.
+    \item To design and implement temperature sensing based on an NTC thermistor for observing the thermal condition of the system.
+    \item To integrate voltage, current, and temperature acquisition into a real-time embedded monitoring framework.
+    \item To implement basic protection logic for abnormal conditions, including over-temperature, over-current, low-current or load-related abnormal behaviour, and low-SoC conditions.
+    \item To implement MOSFET-based load switching so that the monitoring results can be linked to a physical protection action.
+    \item To develop an OLED-based display interface for presenting key battery parameters, warning states, and system status in real time.
+    \item To include supporting demonstration functions, such as simplified SoC estimation and Flash-based runtime statistics, to improve the completeness and observability of the platform.
+\end{enumerate}
+
+Each objective is intended to be verified through subsystem testing and overall system validation. This allows the final work to be assessed not only by whether the individual functions are implemented, but also by whether the integrated platform can demonstrate a coherent battery monitoring and protection process.
+
+\section{Project Scope}
+
+The scope of this project is limited to the design, implementation, and validation of a low-cost embedded BMS demonstration platform for a 3S lithium-ion battery pack. The platform is centred on an STM32 microcontroller and includes the main hardware and software elements required to demonstrate basic battery monitoring and protection. The hardware scope includes the STM32 NUCLEO-G491RE board, INA228 voltage and current sensing module, NTC thermistor temperature sensing circuit, OLED display, MOSFET-based load control circuit, custom PCB design, battery pack connection, external load, laser-cut mounting base, and 3D-printed battery cover.
+
+The functional scope focuses on the acquisition of three core battery parameters: voltage, current, and temperature. Based on these measurements, the system provides real-time status display, basic abnormal-condition detection, and MOSFET-based protection action. Supporting functions, including simplified SoC estimation and Flash-based runtime statistics, are also included to improve the completeness and observability of the demonstration platform. These functions are treated as supporting features rather than the main technical focus of the project.
+
+The project also includes embedded software development, sensor interface implementation, user interface design, protection logic, PCB-level integration, mechanical arrangement, subsystem testing, and overall system validation. The main purpose of the validation is to confirm that the platform can measure key parameters, display system status, detect abnormal conditions, and execute a physical protection response.
+
+This project does not aim to produce a complete industrial-grade BMS. It does not include cell balancing, charging control, advanced SoC or SoH estimation algorithms, certification testing, long-term reliability assessment, or product-level industrial deployment. These excluded functions are commonly associated with more complete commercial or industrial BMS designs [4], [8], [11], [20].
+
+\section{Report Structure}
+
+The remainder of this report is organised as follows. Chapter 2 presents the literature review, covering battery monitoring and protection techniques relevant to this project. It discusses key monitoring parameters, sensing approaches, basic protection requirements, SoC estimation methods, and related low-cost embedded BMS implementations.
+
+Chapter 3 describes the overall system design of the proposed demonstration platform. It introduces the system requirements, overall architecture, hardware structure, software organisation, operating flow, and the main design trade-offs involved in developing a low-cost and observable embedded BMS platform.
+
+Chapter 4 presents the subsystem design and implementation. This chapter explains the major functional modules of the system, including voltage and current measurement, temperature sensing, OLED display and user interaction, MOSFET-based protection control, simplified SoC estimation, Flash-based runtime statistics, and firmware integration.
+
+Chapter 5 presents the overall system test and results. It evaluates whether the integrated platform can acquire key battery parameters, display operating status, detect abnormal conditions, and execute the intended protection response.
+
+Chapter 6 covers the final discussion and conclusions of the project. It first presents the key project outcomes, evaluating achievement against the original objectives, measurement accuracy, and overall system reliability. It then discusses the main limitations and design trade-offs encountered during development, including cost-performance constraints and areas where further refinement would be beneficial. The chapter concludes by summarising the overall findings and outlining potential directions for future work, such as improved calibration methods, more advanced state-of-charge estimation, extended safety functions, and further hardware integration.
+
+\chapter{Literature Review}
+
+\section{Battery Management Systems and Their Core Functions}
+
+A battery management system (BMS) is generally used to ensure that a lithium-ion battery system operates within acceptable electrical and thermal limits. In the literature, the main functions of a BMS normally include parameter monitoring, fault protection, state estimation, cell balancing, thermal management, and communication with external systems [2], [3], [13]. Among these functions, monitoring and protection are the most fundamental because other higher-level functions depend on reliable information about the battery condition.
+
+The most important monitored variables are voltage, current, and temperature. Voltage is directly related to over-charge and over-discharge detection, current reflects charge and discharge behaviour, and temperature indicates thermal stress and potential safety risk [1], [3]. These parameters provide the basic information required for a BMS to judge whether the battery is operating normally. If abnormal conditions such as over-temperature, ovr-current, or unsafe voltage behaviour are detected, the BMS should respond through warning, control, or protection actions. Therefore, the basic functional chain of a BMS can be described as measurement, judgement, protection, and status reporting.
+
+Over the last decade, BMS development has moved beyond simple protection circuits towards more integrated and intelligent systems. Recent reviews show that modern BMS research increasingly focuses on high-precision sensing, digital implementation, data-driven state estimation, functional safety, and system-level integration [1], [2], [9], [19]. Hardware architectures have also become more specialised, with different concepts used for distributed, centralised, and modular battery systems [4]. These developments are important for electric vehicles and large-scale energy storage systems, where reliability, scalability, and safety requirements are high.
+
+However, a complete industrial BMS can be complex. Functions such as cell balancing, charging control, advanced SoC and SoH estimation, thermal management systems, and standard-compliant safety validation often require additional hardware, more complex algorithms, and longer testing procedures [8], [11], [12], [20]. Although these functions are important in commercial applications, they are not always necessary for a low-cost educational demonstration platform. For such a platform, the priority is to make the basic operation of a BMS clear and experimentally verifiable.
+
+Therefore, this project focuses on the core BMS functions that are most suitable for demonstration: voltage, current, and temperature monitoring, abnormal-condition judgement, MOSFET-based protection control, and real-time status display. Supporting functions such as simplified SoC representation and runtime statistics can improve system completeness, but they are not treated as the main technical focus. This approach follows the general trend of BMS development while keeping the system structure transparent, low-cost, and suitable for teaching and validation purposes.
+
+
+\section{Voltage, Current and Temperature Monitoring}
+Voltage, current, and temperature are the most important low-level measurements in lithium-ion battery monitoring. Voltage indicates the electrical operating range of the battery and is closely related to over-charge and over-discharge protection. It can also provide useful information for state estimation when the battery is close to equilibrium. However, terminal voltage alone is not sufficient to describe the real battery condition, because it is affected by load current, internal resistance, temperature, and relaxation behaviour [14], [16]. Therefore, voltage monitoring is necessary, but it should not be used as the only indicator of battery state.
+
+Current measurement provides information about charge and discharge behaviour. It is important for over-current protection, power calculation, energy estimation, and Coulomb-counting-based SoC estimation [14], [17]. In practical BMS designs, current can be measured using shunt-resistor sensing, Hall-effect sensors, or integrated current and power monitoring devices. Hall-effect sensors provide electrical isolation and are suitable for higher-current systems, but they can increase cost and size. Shunt-based sensing is simpler and cheaper, but it requires careful voltage measurement across a small resistance. Integrated digital power monitors combine shunt-voltage and bus-voltage measurement with digital communication, which can reduce analogue front-end complexity in embedded systems [1], [5].
+
+Temperature monitoring is equally important because lithium-ion batteries are sensitive to thermal stress. Excessive temperature can accelerate ageing, reduce reliability, and increase safety risk, especially under high-current or fault conditions [12], [21]. Common temperature sensing methods include thermocouples, platinum resistance temperature detectors such as Pt100 or Pt1000, and NTC thermistors. Thermocouples can cover a wide temperature range, but they normally require cold-junction compensation and additional signal conditioning. Platinum RTDs offer good accuracy and stability, but their cost and interface complexity may be unnecessarily high for a low-cost demonstration platform. NTC thermistors are cheaper, compact, and easy to attach near the battery or load path, making them suitable for basic thermal monitoring where extreme precision is not required.
+
+For this project, voltage, current, and temperature are selected as the core monitored parameters because they provide complementary information. Voltage shows the electrical operating range, current shows the dynamic load condition, and temperature shows the thermal condition of the system. Using these three measurements together allows the platform to demonstrate a more complete monitoring process than a voltage-only design. This supports the development of a low-cost BMS demonstration platform that can show not only measured values, but also the relationship between sensing, abnormal-condition judgement, and protection action.
+
+\section{State-of-Charge Estimation in Low-Cost Systems}
+State-of-Charge (SoC) estimation is an important function in battery management because it provides an indication of the remaining available charge in a battery system. Unlike voltage, current, or temperature, SoC cannot be measured directly by a single sensor. It must be estimated from measurable quantities such as terminal voltage, current, temperature, and previous operating history [14], [15]. In practical BMS applications, SoC information is useful for user display, energy management, low-charge warning, and protection-related decision making [2], [3], [13].
+
+Several SoC estimation methods are commonly discussed in the literature. The open-circuit voltage (OCV) method is simple and low-cost, but it is most reliable when the battery is close to equilibrium. Under load conditions, terminal voltage is affected by internal resistance, polarisation, hysteresis, and temperature, which limits the accuracy of a voltage-only SoC estimate [16], [25]. Coulomb counting estimates SoC by integrating current over time and is suitable for real-time tracking, but it can accumulate drift due to current measurement error, initial SoC uncertainty, and capacity variation [17], [18].
+
+More advanced methods, such as Kalman-filter-based observers, equivalent-circuit-model-based estimation, and data-driven or AI-based methods, can improve estimation accuracy under dynamic operating conditions [14], [17], [18]. However, these methods normally require accurate model parameters, calibration data, battery characterisation tests, or a larger amount of training data. This increases the development complexity and makes them less suitable for a low-cost demonstration platform where transparency, implementation simplicity, and real-time operation are more important than high-precision battery modelling.
+
+For this project, SoC estimation is included mainly to make the battery state more understandable to the user. A lightweight hybrid approach is therefore more appropriate than a full advanced estimator. The implemented method combines OCV-based initialisation, current integration through Coulomb counting, and a simple voltage-based correction or filtering stage. This allows the OLED interface to present a reasonable indication of battery state while keeping the algorithm understandable and suitable for embedded implementation. The SoC result is therefore used as a supporting display and warning indicator rather than as a highly calibrated measurement output.
+
+\section{Existing Low-Cost and Prototype BMS Solutions}
+Low-cost and prototype-level BMS solutions are widely discussed in applications such as photovoltaic systems, residential energy storage, IoT-based monitoring, and compact battery monitoring tools [10], [22]–[24]. These studies show that low-cost platforms can be useful for early validation, data acquisition, and small-scale energy storage applications. Compared with industrial BMS products, they usually reduce hardware cost and implementation complexity by using embedded controllers, simpler sensing circuits, and limited protection functions.
+
+However, many low-cost or prototype systems still have limitations from a demonstration perspective. Some systems focus mainly on data collection or remote monitoring, while the internal relationship between sensing, decision-making, protection action, and user feedback is not always clearly visible [22], [23]. In this sense, the system may still behave like a black box: measured data are produced and outputs are shown, but the complete operating chain is not easy to observe or explain. This limits their value in teaching environments where the purpose is not only to obtain results, but also to understand how the BMS works.
+
+Another limitation is functional separation. A low-cost monitoring platform may measure voltage, current, or temperature, but may not clearly connect these measurements to real-time display and physical protection control. Conversely, more complete BMS architectures may include balancing, advanced estimation, communication, and safety validation, but this increases hardware and software complexity [2]–[4], [8], [11]. For educational and validation-oriented systems, a balance is therefore needed between functional completeness, transparency, cost, and implementation effort.
+
+This project addresses this gap by focusing on a low-cost BMS demonstration platform rather than a commercial BMS replacement. The intended contribution is not to outperform industrial systems, but to provide a clear and observable platform in which voltage, current, and temperature monitoring are connected to display, abnormal-condition judgement, and MOSFET-based protection. This makes the system more suitable for explaining the basic BMS operating chain and for validating the feasibility of a compact embedded implementation.
+
+\section{Design Implications for This Project}
+The literature review shows that a BMS must first provide reliable monitoring and protection before more advanced functions can be meaningful. Although modern BMS development is moving towards higher integration, more advanced sensing, and more intelligent state estimation, the most essential requirement remains the ability to measure key battery parameters and respond to abnormal conditions [1]–[3], [13]. For this project, this means that voltage, current, and temperature monitoring should form the technical foundation of the system.
+
+A second implication is that the design must remain transparent and suitable for demonstration. Many complete BMS architectures include functions such as balancing, charging control, communication, and advanced estimation, but these functions also increase system complexity [4], [8], [11], [14]. For an educational demonstration platform, excessive complexity can make the system harder to understand and less effective for explaining the basic BMS operating process. Therefore, the design should prioritise a clear measurement-to-protection chain rather than the maximum number of functions.
+
+A third implication is the need to balance reliability, low cost, and implementation simplicity. Low-cost BMS and monitoring platforms reported in the literature show that embedded controllers and compact sensing circuits can support practical validation, but their value depends on how clearly the measured data are connected to system behaviour [10], [22]–[24]. This supports the selection of an STM32-based embedded controller, an integrated digital voltage and current monitoring device, an NTC thermistor for temperature sensing, an OLED for local status display, and a MOSFET for visible load-control action.
+
+Therefore, the design direction of this project is not to develop the most advanced estimation algorithm or a full industrial BMS. Instead, the project aims to implement a clear and verifiable BMS demonstration platform in which sensing, judgement, display, and protection can be observed as one connected process. Based on these design implications, the next chapter presents the overall system architecture and explains how the selected hardware and software structure supports this objective.
+
+\chapter{Overall System Design}
+
+\section{System Requirements and Design Objectives}
+
+This section defines the practical system requirements used to guide the overall design. Unlike the project aim in Section 1.2, these requirements describe the operating case, functional needs, design constraints, and validation conditions of the final demonstration platform. The system is intended to operate with a low-voltage 3S lithium-ion battery pack and an external load, so the design must support real-time monitoring, visible user feedback, and basic protection behaviour under controlled laboratory conditions.
+
+The key use case is a classroom or laboratory demonstration in which the battery pack powers a small load while the platform measures electrical and thermal parameters, displays the system state, and disconnects the load when an abnormal condition is detected. Therefore, the system requirements are not only electrical requirements, but also demonstration and testing requirements. The main requirements are summarised in Table 3.1.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+{\hbadness=10000\relax
+\caption{System design requirements for the BMS demonstration platform}
+\label{tab:system_design_requirements}
+\begin{tabularx}{\textwidth}{|p{0.18\textwidth}|Y|Y|}
+\hline
+\textbf{Requirement Area} & \textbf{Requirement} & \textbf{Purpose} \\
+\hline
+Use case & Operate as a low-cost BMS demonstration platform for a 3S lithium-ion battery pack and small external load. & Provide a realistic but manageable laboratory demonstration case. \\
+\hline
+Monitoring & Measure voltage, current, and temperature using INA228 and NTC sensing. & Provide key electrical and thermal data for display and protection. \\
+\hline
+Protection & Disconnect the load through a MOSFET under over-temperature, over-current, load abnormality, or severe fault conditions. & Convert monitoring results into a visible protection action. \\
+\hline
+User interface & Display system status on an OLED and support basic interaction using the onboard B1 button. & Make the operating state visible and easy to demonstrate. \\
+\hline
+Supporting functions & Include simplified SoC indication and Flash-based runtime statistics. & Improve system completeness without changing the core focus. \\
+\hline
+Cost and implementation & Use low-cost components and an STM32-based bare-metal design without RTOS. & Keep the platform repeatable, simple, and suitable for student projects. \\
+\hline
+Validation & Test major functions individually before full integration. & Support clear verification of sensing, display, interaction, and protection. \\
+\hline
+Boundary & Exclude charging control, cell balancing, certification, and long-term reliability testing. & Keep the project focused on monitoring, display, and basic protection. \\
+\hline
+\end{tabularx}
+}
+\end{table}
+
+\vspace{-0.5\baselineskip}
+
+\section{Overall System Architecture}
+
+\begingroup
+\setstretch{1.15}
+Figure~3.2.1 shows the overall physical arrangement of the developed low-cost BMS demonstration platform. The system is built around a 3S lithium-ion battery pack, a NUCLEO-G491RE development board, an INA228 voltage and current sensing module, an NTC temperature sensing circuit, an OLED display, a MOSFET load-switching stage, and an external load. The NUCLEO-G491RE is suitable for this type of embedded demonstration because it provides an STM32G491RET6 microcontroller, access to STM32G4 I/O pins through expansion headers, and an integrated STLINK-V3E debugger/programmer for development and testing~\cite{ref6}.
+
+The overall architecture can be divided into two main paths. The first is the power path, where the battery pack supplies the load through the current sensing and MOSFET switching stage. This allows the platform to demonstrate how the load can be disconnected when abnormal operation is detected. The second is the signal and control path, where the INA228 provides voltage and current information to the STM32 through I2C, while the NTC circuit provides temperature information through an ADC input. The STM32 then processes these measurements, updates the OLED display, and controls the MOSFET according to the protection logic.
+
+The system also includes supporting software functions such as simplified SoC indication and Flash-based runtime statistics. These functions improve the completeness of the platform but remain secondary to the main monitoring and protection chain. Overall, the architecture follows a clear sequence of sensing, processing, display, and protection control, which provides the basis for the more detailed hardware and software descriptions in the following sections.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.4\textwidth]{figures/shipai.jpg}
+\caption{Overall physical arrangement of the low-cost BMS demonstration platform, showing the 3S battery pack, NUCLEO-G491RE controller, INA228 sensing module, OLED display, MOSFET load-control stage, and external load.}
+\label{fig:overall_physical_arrangement}
+\end{figure}
+
+\endgroup
+
+\section{Hardware and Software Architecture}
+
+
+
+
+Figure~\ref{fig:hardware_architecture} presents the hardware architecture of the developed BMS demonstration platform. The system is arranged around a 3S lithium-ion battery pack, which supplies the external load through the INA228 high-side measurement path and the MOSFET-based load-switching stage. The STM32 microcontroller reads voltage, current, and temperature data, updates the OLED display, and drives the MOSFET so that a software protection decision can be converted into a physical load-disconnection action.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.45\textwidth]{figures/hardware_architecture.png}
+\caption{Hardware architecture of the low-cost BMS demonstration platform, showing the power path, sensing interfaces, STM32 controller, OLED display, and MOSFET load-control stage.}
+\label{fig:hardware_architecture}
+\end{figure}
+
+The hardware design was implemented using a modular structure. The main functional blocks include the power supply, INA228 voltage and current measurement, NTC temperature sensing, OLED display, MOSFET load control, and STM32 interface connections, as shown in Fig.~\ref{fig:pcb_layout}. This modular arrangement makes the system easier to assemble, test, debug, and explain during demonstration. The NUCLEO-G491RE development board was selected as the main controller because it provides the required ADC, I\textsuperscript{2}C, GPIO, timer, Flash memory, expansion-header, and integrated STLINK-V3E debugging resources for embedded prototyping \cite{ref26}. The INA228 module was used for voltage and current monitoring because it integrates a 20-bit ADC, I\textsuperscript{2}C digital interface, bus-voltage and shunt-voltage measurement, and internal support for current, power, energy, and charge calculation \cite{ref5}. This reduces the need for a discrete analogue measurement front-end.
+
+Temperature monitoring is implemented using an NTC thermistor divider connected to an STM32 ADC input. This provides a low-cost and compact method for demonstration-level thermal monitoring. The OLED display is connected through I\textsuperscript{2}C and provides local visual feedback of voltage, current, temperature, SoC, runtime information, and fault state. In addition to the electronic circuit, the platform includes a custom PCB, laser-cut mounting base, and 3D-printed battery cover to improve physical integration and visual clarity.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.62\textwidth]{figures/pcb_layout.png}
+\caption{Schematic and PCB layout of the low-cost BMS demonstration platform, showing the main functional circuit blocks and their physical implementation.}
+\label{fig:pcb_layout}
+\end{figure}
+
+Figure~\ref{fig:software_flow} shows the software operation flow of the BMS demonstration platform. The embedded software was developed in C using STM32CubeIDE, with peripheral configuration supported by STM32CubeMX-generated initialisation code and firmware debugging/programming carried out through the onboard STLINK-V3E interface. The hardware circuit and PCB were designed and reviewed at schematic and layout level before assembly, so that the software development and hardware integration could be tested progressively rather than only at the final system stage. The firmware uses a bare-metal superloop rather than an RTOS, because the required tasks are lightweight and can be scheduled using simple timing logic. After power-on, the software initializes GPIO, I\textsuperscript{2}C, UART, TIM6, INA228, ADC, OLED, MOSFET control, and Flash-related data handling. The system then performs an initial preheating and OCV-based initialization stage of approximately 3~s before entering normal operation.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.36\textwidth]{figures/software_flow.png}
+\caption{Software operation flow of the low-cost BMS demonstration platform, showing initialization, TIM6-based button handling, main-loop task execution, protection decision-making, and fault-state handling.}
+\label{fig:software_flow}
+\end{figure}
+
+The software is organised using a two-layer timing structure. The first layer is a TIM6-based button sampling layer, which provides a fixed 5~ms time base for reading the onboard B1 button and performing debounce processing. The B1 user button is integrated on the Nucleo board and is connected to the STM32G4 microcontroller by default \cite{ref26}. This timing layer avoids relying only on the main loop for button detection, because OLED refresh and I\textsuperscript{2}C communication may introduce variable delays. The second layer is the main superloop, which handles sensor updates, state-machine processing, MOSFET control, runtime statistics, and OLED refresh.
+
+During normal operation, the STM32 reads voltage and current from the INA228 through I\textsuperscript{2}C and reads temperature from the NTC circuit through the ADC. The control logic then evaluates over-temperature, over-current, under-current or load abnormality, and low-SoC warning conditions. Under abnormal conditions, the MOSFET can be turned off to place the load path in a safer state. If a severe fault is detected, the system enters a fault state, forces the MOSFET off, and waits for a hardware reset.
+
+This hardware and software architecture keeps the platform simple, observable, and testable. It supports the main purpose of the project: demonstrating the sensing, processing, display, and protection chain of a low-cost BMS demonstration platform without introducing unnecessary industrial-level complexity.
+\section{System-Level Design Rationale}
+
+The system-level design was based on practical trade-offs between size, demonstrability, implementation risk, and functional completeness. Unlike a compact commercial BMS, the final platform was built on an approximately 30~cm $\times$ 30~cm mounting base. This larger layout was intentional, because the project is a demonstration platform rather than a miniaturised product. As shown in Figure~\ref{fig:mounting_base}, the wider physical layout allows the battery pack, sensing module, controller, display, load path, and protection stage to remain visible and accessible. This improves debugging, inspection, and explanation during laboratory demonstration.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.36\textwidth]{figures/laser.png}
+\caption{CAD model of the mounting base used to support the 30 cm × 30 cm demonstration layout.}
+\label{fig:mounting_base}
+\end{figure}
+
+A second trade-off was made between integration risk and development efficiency. The NUCLEO-G491RE board was selected because it provides the required ADC, I2C, GPIO, timer, Flash, and debugging resources in a ready-to-use STM32 development platform~\cite{ref6}. Previous experience with STM32 development also reduced the learning time. Similarly, the INA228 module was selected because it integrates voltage, current, power, energy, and charge monitoring with an I2C interface~\cite{ref5}. Compared with a discrete analogue front-end, this reduced circuit design risk and allowed more time to be spent on system integration and testing.
+
+The sensing and software choices also reflect the same design logic. An NTC thermistor was used for temperature sensing because it is small, low-cost, and sufficient for demonstration-level thermal monitoring. Thermocouples and platinum resistance sensors can provide higher performance in some applications, but their cost and interface complexity are less suitable for this platform. The firmware was implemented as a bare-metal superloop rather than an RTOS, because the required tasks are lightweight and can be handled using simple timing logic. A TIM6-based timing layer was used for button sampling and debounce, while the main loop handles sensing, display, protection, and runtime statistics.
+
+More complex BMS functions, such as cell balancing and charging control, were not implemented because they would require additional hardware, more development time, and extra safety validation. These functions are important in complete industrial BMS designs~\cite{ref2}, but they are beyond the central purpose of this platform. SoC estimation was retained as a software extension feature because it improves battery-state representation and demonstrates that higher-level functions can be added on top of the core sensing chain~\cite{ref14}.
+\Needspace{4\baselineskip}
+Overall, the design prioritises visibility, testability, and clear functional demonstration over miniaturisation and industrial completeness. It is not intended to replace a commercial BMS, but it provides a practical and understandable demonstration of the core monitoring, display, and protection chain.
+
+
+\chapter{Subsystem Design and Test}
+
+\section{Voltage and Current Measurement}
+
+Voltage and current measurement form the main electrical sensing function of the low-cost BMS demonstration platform. In this system, voltage is used to observe the battery pack condition and support basic protection decisions, while current is required to understand load behaviour, calculate power, and provide input for later state-of-charge estimation. Therefore, this subsystem acts as one of the most important information sources for the whole system.
+
+The measurement subsystem uses a Texas Instruments INA228 digital power monitor, implemented through the Adafruit INA228 I\textsuperscript{2}C Power Monitor breakout board. This distinction is important because the INA228 itself is the measurement integrated circuit, while the Adafruit breakout board provides the practical module form and includes the 0.015~$\Omega$ shunt resistor used in this project \cite{ref5},\cite{ref28}. The INA228 was selected mainly because it provides high measurement precision while keeping the hardware implementation simple. According to the datasheet, the device integrates a 20-bit delta-sigma ADC, supports bus-voltage measurement up to 85~V, and provides maximum shunt-voltage and bus-voltage gain errors of $\pm 0.05\%$ \cite{ref5}. It can also report bus voltage, shunt voltage, current, power, energy, and charge through an I\textsuperscript{2}C interface \cite{ref5}. These features make it suitable for this demonstration platform because the project requires reliable voltage and current values, but does not require a complex industrial BMS analogue front-end.
+
+In this project, the INA228 is connected in a high-side measurement configuration. The battery pack output passes through the INA228 measurement path before supplying the load and the MOSFET-controlled output stage. This allows the system to measure the pack voltage and discharge current without disturbing the system ground reference. From an implementation point of view, this was more practical than designing a custom current-sensing PCB using an operational amplifier, external ADC input, and discrete analogue filtering. The Adafruit breakout board also simplified the build process because it could be connected directly to the microcontroller and power path without additional precision analogue soldering work \cite{ref28}.
+
+The INA228 communicates with the STM32G491RE microcontroller through I\textsuperscript{2}C. In practical wiring, only four main signal and power connections are needed: supply, ground, SCL, and SDA. This makes the subsystem easy to connect, inspect, and explain during demonstration. This is important for the aim of the project, because the platform is designed not only to function, but also to make the sensing and protection process physically clear and understandable. The use of a digital power monitor therefore supports both the technical reliability and the presentation clarity of the final system.
+
+The raw digital readings from the INA228 are converted into physical voltage and current values in firmware. The bus voltage is calculated as
+\begin{equation}
+V_{BUS}=N_{BUS}\times 195.3125~\mu\mathrm{V}
+\end{equation}
+where $N_{BUS}$ is the raw bus-voltage register value. The shunt voltage is calculated as
+\begin{equation}
+V_{SHUNT}=N_{SHUNT}\times 78.125~\mathrm{nV}
+\end{equation}
+where $N_{SHUNT}$ is the raw shunt-voltage register value in the high-sensitivity shunt range. The load current is then obtained using Ohm's law:
+\begin{equation}
+I=\frac{V_{SHUNT}}{R_{SHUNT}}
+\end{equation}
+where $R_{SHUNT}=0.015~\Omega$ for the Adafruit INA228 breakout board used in this project \cite{ref5},\cite{ref28}. These equations provide a clear conversion path from the INA228 register values to the voltage and current values used by the firmware.
+
+During testing, the measured battery pack voltage was typically around 11.1~V, which is consistent with the nominal voltage of the 3S lithium-ion battery pack used in the platform. The load current was usually in the range of several hundred milliamps, although the exact value changed with the load condition and battery state. The INA228 readings were repeatedly compared with a handheld multimeter, and the measured voltage and current values were found to match closely under normal test conditions. This confirmed that the subsystem was accurate enough for real-time OLED display, protection threshold checking, power-related calculation, and later SoC estimation.
+
+The main limitation of this subsystem is that the final measurement stability still depends on practical implementation factors, such as wiring quality, shunt connection resistance, I\textsuperscript{2}C communication reliability, and electrical noise from the load path. Although the INA228 provides high-resolution digital measurement, this project did not include a detailed noise-characterisation experiment or a dedicated external analogue filtering stage. Therefore, the subsystem should be understood as a reliable and low-cost measurement solution for a demonstration platform, rather than a fully calibrated industrial BMS measurement front-end. The practical output of the voltage and current measurement subsystem is shown in Fig.~\ref{fig:volt-current-display}. The OLED pages display a battery-pack voltage of 11.148~V and a load current of 173.3~mA, showing that the INA228 readings were successfully acquired by the STM32 and transferred to the user interface during operation.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.42\textwidth]{figures/volt_current_display.png}
+\caption{OLED display of the measured battery-pack voltage and load current obtained from the INA228 during operation.}
+\label{fig:volt-current-display}
+\end{figure}
+
+\section{Temperature Measurement}
+
+Temperature measurement is an important function in the proposed low-cost BMS demonstration platform. Before integrating the NTC thermistor into the final sensing circuit, its resistance--temperature characteristic was first checked against the calculated Beta-model curve. This was done to confirm that the selected thermistor followed the expected nonlinear negative-temperature-coefficient behaviour and that the firmware conversion method was based on a reasonable sensing model.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.68\textwidth]{figures/ntc_resistance_temperature_curve.png}
+    \caption{Comparison between measured NTC resistance values and the calculated resistance--temperature curve based on the Beta model.}
+    \label{fig:ntc-rt-comparison}
+\end{figure}
+
+As shown in Fig.~\ref{fig:ntc-rt-comparison}, the measured resistance values follow the same decreasing trend as the calculated curve. The resistance changes rapidly at lower temperatures and more gradually at higher temperatures, which is consistent with the expected behaviour of an NTC thermistor. The close agreement between the measured and calculated values indicates that the selected NTC thermistor and the Beta-model conversion are suitable for demonstration-level temperature monitoring in this project \cite{ref30}.
+
+Battery temperature affects operating safety, measurement reliability, and later protection behaviour, so temperature monitoring is commonly treated as one of the key sensing requirements in battery management systems \cite{ref1}, \cite{ref3}, \cite{ref12}. In this project, the aim was not to implement a complex industrial thermal-management system, but to provide a simple, low-cost, and sufficiently accurate temperature-sensing method that could be integrated into the monitoring and display framework. Therefore, the NTC-based subsystem was selected as a practical solution for observing thermal behaviour and supporting the later MOSFET-based protection response.
+
+The temperature measurement subsystem uses a TDK B57863S0103G040 NTC thermistor. This device has a nominal resistance of 10~k$\Omega$ at 25$^{\circ}$C and a Beta value of $B_{25/100}=3988$~K \cite{ref30}. It was selected because it is inexpensive, easy to obtain, and simple to integrate using a basic resistor-divider circuit. For a demonstration platform, this provides a practical balance between cost, implementation complexity, and measurement performance.
+
+The practical temperature-sensing circuit is shown in Fig.~\ref{fig:ntc-divider}. A fixed 27~k$\Omega$ resistor is connected between the 3.3~V supply and the ADC sensing node, while the NTC thermistor is connected between the same node and ground. The sensing node is connected to PA0, which is configured as an ADC input on the STM32G491RE. The STM32G491RE provides on-chip ADC resources suitable for embedded analogue sensing, while ADC accuracy can be affected by reference voltage, source impedance, sampling time, and noise conditions \cite{ref6},\cite{ref7}. A 0.1~$\mu$F capacitor is also connected between the sensing node and ground to reduce high-frequency noise and improve the stability of the sampled voltage.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.52\textwidth]{figures/ntc_divider_circuit.png}
+\caption{NTC-based temperature measurement circuit connected to the STM32 ADC input.}
+\label{fig:ntc-divider}
+\end{figure}
+
+The ADC conversion first converts the raw digital code into the sampled node voltage:
+\begin{equation}
+V_{NTC}=\frac{N_{ADC}}{4095}\times V_{DDA}
+\end{equation}
+where $N_{ADC}$ is the 12-bit ADC output code and $V_{DDA}$ is the ADC reference voltage, taken as 3.3~V in this project. The NTC resistance is then calculated from the voltage-divider relationship:
+\begin{equation}
+R_{NTC}=R_{FIX}\times \frac{V_{NTC}}{V_{DDA}-V_{NTC}}
+\end{equation}
+where $R_{FIX}=27$~k$\Omega$ is the fixed resistor. After the thermistor resistance is obtained, the temperature is estimated using the Beta model:
+\begin{equation}
+\frac{1}{T}=\frac{1}{T_0}+\frac{1}{B}\ln\left(\frac{R_{NTC}}{R_0}\right)
+\end{equation}
+where $T$ is the absolute temperature in kelvin, $T_0=298.15$~K corresponds to 25$^{\circ}$C, $R_0=10$~k$\Omega$, and $B=3988$~K \cite{ref30}. Finally, the result is converted into degrees Celsius:
+\begin{equation}
+T_C=T-273.15
+\end{equation}
+
+The calculated temperature value is updated in firmware and displayed on the OLED interface together with the other system parameters. Fig.~\ref{fig:temp-display} shows the practical temperature display during testing. The displayed value behaved as expected under normal operating conditions, confirming that the NTC divider, ADC sampling, firmware conversion, and OLED display path were successfully integrated.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.35\textwidth]{figures/temp_display.jpg}
+\caption{OLED display showing the measured temperature obtained from the NTC sensing circuit during testing.}
+\label{fig:temp-display}
+\end{figure}
+
+The temperature-related protection threshold is implemented in firmware and can be adjusted according to the test requirement. However, the control behaviour is not discussed in detail in this subsection, because the MOSFET-based protection action is covered separately in Section~4.4. In this subsection, the focus is on the sensing chain itself: the NTC converts temperature variation into resistance change, the resistor divider converts this resistance change into voltage, and the STM32 ADC converts the voltage into a digital value for firmware processing.
+
+The main limitation of this subsystem is that the final temperature accuracy depends on the tolerance of the NTC thermistor, the fixed resistor, and the ADC reference voltage. The measured value can also be affected by electrical noise, sensor placement, and thermal contact between the NTC and the monitored battery region. In addition, this project did not include a full multi-point temperature calibration procedure. Therefore, the measured temperature should be understood as sufficiently accurate for demonstration and basic protection purposes, rather than as a fully calibrated industrial temperature measurement.
+
+\section{OLED Display and User Interface}
+
+The OLED display was implemented to make the operating state of the BMS demonstration platform directly visible during testing. It provides local feedback for measured values, warning states, runtime information, and user interaction without requiring an external computer or serial terminal.
+
+The display module is a 128$\times$64 monochrome OLED based on the SSD1306 controller. The SSD1306 integrates the display RAM, segment driver, common driver, and controller functions required for compact OLED operation \cite{ref29}. In this system, the OLED is connected to the STM32G491RE through I\textsuperscript{2}C3, so only four main connections are required: power, ground, SCL, and SDA. This keeps the wiring simple and makes the display module easy to test or replace.
+
+Because the 128$\times$64 display area is limited, the interface was designed as a page-based user interface rather than a single crowded screen. The implemented interface includes eight main pages: SoC, SoC curve, temperature, voltage, current, runtime information, and two Flash-based statistics pages. This allows each parameter to be displayed with a clearer layout and larger text. The practical OLED interface is shown in Fig.~\ref{fig:oled-display}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.52\textwidth]{figures/UI.png}
+\caption{OLED display pages used in the BMS demonstration platform for local presentation of key monitoring parameters.}
+\label{fig:oled-display}
+\end{figure}
+
+User interaction is provided through the onboard B1 button on the NUCLEO-G491RE board. The B1 user button is integrated on the Nucleo board and is connected to the STM32G4 microcontroller by default \cite{ref26}. In the implemented firmware, a single press is used for page switching, while a double press is used for entering or saving editable settings where required. This provides a simple interaction method without adding an external keypad or rotary encoder.
+
+The OLED interface links the main sensing and control functions of the platform. Voltage and current from the INA228, temperature from the NTC circuit, SoC estimation, runtime statistics, and fault-related information can all be presented locally. This makes the measurement, processing, display, and protection chain easier to observe during demonstration.
+
+The main limitation is the small display size. Although 128$\times$64 pixels are sufficient for showing one or two key values per page, the screen cannot show all parameters, trends, warnings, and settings at the same time without reducing readability. The interface is also limited to local display and does not provide remote monitoring or long-term graphical data logging. However, for a low-cost BMS demonstration platform, the OLED provides a clear and practical local user interface.
+
+\section{MOSFET-Based Protection Control}
+
+The MOSFET-based protection control stage was implemented to convert software protection decisions into a physical load-disconnection action. In this project, the MOSFET is used as a controllable load switch rather than a high-frequency switching device. Under normal conditions, the load path is enabled. When an abnormal condition is detected, the STM32 changes the GPIO output state and turns the MOSFET off.
+
+The protection stage uses an IRLZ44NPbF logic-level N-channel MOSFET. This device was selected because it can be driven by a microcontroller-level gate signal and has a low drain-source on-resistance, making it suitable for low-voltage load-switching applications \cite{ref32}. The implemented MOSFET control circuit is shown in Fig.~\ref{fig:mosfet-schematic}. In the implemented system, the STM32 drives the MOSFET gate through a GPIO output, while the load current path is switched by the MOSFET stage.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.62\textwidth]{figures/mosfet_schematic.png}
+\caption{MOSFET-based load switching circuit used for protection control in the BMS demonstration platform.}
+\label{fig:mosfet-schematic}
+\end{figure}
+
+The MOSFET control decision is generated after the main sensing values have been updated. The firmware first reads the battery voltage and load current from the INA228, then reads the temperature from the NTC sensing circuit. These measured values are compared with configurable protection thresholds. The general protection decision can be expressed as
+\begin{equation}
+F_{prot}=F_T \lor F_I \lor F_L \lor F_{SOC}
+\end{equation}
+where $F_{prot}$ is the overall protection flag, $F_T$ is the over-temperature flag, $F_I$ is the over-current flag, $F_L$ is the load-abnormality flag, and $F_{SOC}$ is the low-SoC warning or severe low-state flag.
+
+The temperature-related flag is defined as
+\begin{equation}
+F_T =
+\left\{
+\begin{array}{ll}
+1, & T > T_{lim} \\
+0, & T \leq T_{lim}
+\end{array}
+\right.
+\end{equation}
+where $T$ is the measured temperature and $T_{lim}$ is the selected temperature threshold. In the implemented firmware, selected protection thresholds can be adjusted through the OLED user interface during testing. This allows different protection settings to be demonstrated without changing the hardware.
+
+The current-related fault condition is evaluated using the measured load current:
+\begin{equation}
+F_I =
+\left\{
+\begin{array}{ll}
+1, & |I| > I_{lim} \\
+0, & |I| \leq I_{lim}
+\end{array}
+\right.
+\end{equation}
+where $I$ is the measured current and $I_{lim}$ is the over-current threshold. A load-abnormality condition can also be detected when the load is expected to be connected but the measured current remains below a minimum level for a defined delay:
+\begin{equation}
+F_L =
+\left\{
+\begin{array}{ll}
+1, & |I| < I_{min} \quad \mbox{for} \quad t > t_{delay} \\
+0, & \mbox{otherwise}
+\end{array}
+\right.
+\end{equation}
+where $I_{min}$ is the minimum expected load current and $t_{delay}$ is the fault-confirmation delay. This delay avoids triggering a fault from a short transient measurement.
+
+The GPIO output to the MOSFET is then determined by the protection flag:
+\begin{equation}
+GPIO_{MOS} =
+\left\{
+\begin{array}{ll}
+0, & F_{prot}=1 \\
+1, & F_{prot}=0
+\end{array}
+\right.
+\end{equation}
+where $GPIO_{MOS}=1$ represents the normal enabled state and $GPIO_{MOS}=0$ represents the load-disconnection state. If a severe fault is detected, the firmware enters the fault state, forces the MOSFET off, and keeps the load disconnected until reset.
+
+The subsystem was tested using a cause-and-effect method. First, the system was operated under normal load conditions to confirm that the MOSFET remained enabled. Then, abnormal conditions were introduced by heating the NTC thermistor or changing the external load so that the current exceeded the expected range. The OLED display and load behaviour were observed to confirm that the fault condition was detected and that the MOSFET output changed state. This verified the protection chain from sensing, threshold judgement, GPIO control, MOSFET switching, and physical load disconnection.
+
+The main limitation of this protection stage is that the decision depends on sensor readings and firmware logic. Therefore, incorrect sensor data or unsuitable threshold settings can affect the protection response. Nevertheless, the implemented MOSFET control stage provides a clear and testable way to demonstrate how monitored battery conditions can be converted into a visible protection action.
+
+\section{State-of-Charge Estimation}
+
+State-of-Charge (SoC) estimation was implemented as a supporting function of the BMS demonstration platform. The purpose of this function is not to provide a highly calibrated battery model, but to give the user a reasonable indication of the remaining battery state on the OLED display. Since SoC cannot be measured directly by a single sensor, it must be estimated from measurable variables such as voltage, current, and previous operating history \cite{ref14,ref15}. In this project, a lightweight hybrid method was used, combining OCV-based initialisation, Coulomb counting, and a small voltage-based correction.
+
+After power-on, the system performs an initialisation stage of approximately 3~s. During this period, the battery pack voltage is sampled several times using the INA228. Invalid readings outside the expected 3S battery range are rejected, and the remaining valid voltage readings are averaged. The average pack voltage is then divided by three to estimate the equivalent single-cell voltage. This voltage is used to initialise the SoC through an OCV lookup table. The OCV-based method is simple and suitable for initial estimation, although it is most reliable when the battery is close to a rested condition \cite{ref16,ref25}.
+
+During normal operation, the SoC is updated mainly by Coulomb counting. The measured current from the INA228 is integrated over time using the actual sampling interval:
+\begin{equation}
+SOC_k = SOC_{k-1} - \frac{|I_k|\Delta t}{C_{nom}\times3600}
+\end{equation}
+where $SOC_k$ is the updated state of charge, $I_k$ is the measured load current, $\Delta t$ is the actual sampling interval in seconds, and $C_{nom}=2.2$~Ah is the nominal battery capacity used in this project. The use of the actual time interval rather than a fixed interval reduces integration error caused by small timing variations in the main loop.
+
+To limit long-term drift, a lightweight OCV correction is applied when the load current is small. In this condition, the terminal voltage is less affected by load-induced voltage drop, so the OCV lookup result can be used as a weak correction term:
+\begin{equation}
+SOC = 0.98SOC_{cc}+0.02SOC_{ocv}
+\end{equation}
+where $SOC_{cc}$ is the Coulomb-counting result and $SOC_{ocv}$ is the SoC estimated from the voltage lookup table. A small 2\% correction factor was selected so that the displayed SoC can slowly move towards the voltage-based estimate without being dominated by short-term voltage fluctuation. The final SoC value is limited between 0 and 100\% before being displayed.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.15\textwidth]{figures/SOC.png}
+\caption{OLED display showing the estimated SoC value using both numerical percentage and graphical bar representation.}
+\label{fig:soc-display}
+\end{figure}
+
+The implemented SoC page is shown in Fig.~\ref{fig:soc-display}. The OLED interface presents the estimated SoC both as a numerical percentage and as a graphical battery-style bar. The percentage gives a direct quantitative reading, while the bar provides a more intuitive visual indication of the remaining charge. In the wider software structure, the SoC result is also used as a supporting warning indicator, for example when the estimated value falls below the selected low-SoC threshold.
+
+The main limitation of this method is its accuracy. Coulomb counting can accumulate drift when current measurement error, capacity uncertainty, or initial SoC error is present \cite{ref17}. The OCV correction also has limited accuracy under load because terminal voltage is affected by internal resistance, polarisation, temperature, and relaxation behaviour \cite{ref16}. More advanced methods such as Kalman-filter-based estimation or equivalent-circuit-model observers could improve dynamic SoC estimation \cite{ref14,ref18}. However, these methods require battery model parameters, calibration data, and more complex validation. For this project, they were not adopted because the aim was to keep the algorithm transparent, implementable on the STM32, and suitable for a low-cost demonstration platform.
+\section{Runtime Statistics and Data Handling}
+
+
+Runtime statistics were implemented to improve the observability and completeness of the BMS demonstration platform. In addition to real-time monitoring, the system records selected historical information so that previous operation, maximum values, and fault history can be inspected directly from the OLED interface. This function is mainly intended for demonstration and debugging rather than long-term industrial data logging.
+
+The recorded data are divided into two OLED statistics pages. The first page presents general runtime information, including boot count, accumulated runtime, historical maximum temperature, and total output energy. The second page presents more detailed electrical and fault-related information, including maximum current, maximum power, total fault count, and the last recorded fault type. These values are derived from the existing sensing chain: voltage and current are obtained from the INA228, temperature is obtained from the NTC sensing circuit, and runtime is calculated from the firmware time base. Output power and accumulated energy are calculated from the measured voltage, current, and elapsed time.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.60\textwidth]{figures/flash_stats.png}
+\caption{OLED statistics pages showing Flash-based runtime data retained by the BMS demonstration platform.}
+\label{fig:flash-stats}
+\end{figure}
+
+The implemented statistics pages are shown in Fig.~\ref{fig:flash-stats}. These pages allow the user to check not only the present operating state, but also the historical behaviour of the platform. This is useful during testing because it provides a simple way to confirm whether the system has experienced over-temperature, over-current, or other load-related abnormal conditions.
+
+To retain the statistics after reset or power loss, the data are stored in the internal Flash memory of the STM32. A simple validity mechanism is used when loading the data: the firmware checks a magic number and checksum before accepting the stored structure. If the stored data are invalid, the statistics are reinitialised to default values. This prevents corrupted Flash contents from being treated as valid runtime records.
+
+Flash writing is controlled using a dirty flag and a periodic save strategy. The statistics are not written continuously every time a value changes. Instead, the firmware marks the data as dirty when an update occurs and saves them at a longer interval, approximately once per minute during operation. This was selected because the platform is mainly used for short demonstration and laboratory tests, where second-by-second persistent logging is unnecessary. At the same time, periodic saving is sufficient to preserve useful runtime information while reducing unnecessary Flash erase/write cycles.
+
+A clear function is also included for demonstration and maintenance. From the detailed statistics page, the user can enter a clear-confirmation process and reset the stored statistics when required. This makes the system easier to reuse between tests, while still showing that the platform can manage persistent runtime data rather than only displaying instantaneous measurements.
+
+The main limitation of this data-handling method is that it is not a full data-logging system. The internal Flash memory has limited erase/write endurance, so it is not suitable for high-frequency logging. The stored values are summary statistics rather than complete time-series records, and the system does not include SD-card logging, PC-side data capture, or remote communication.
+\section{Firmware Integration}
+
+Firmware integration was carried out to connect the sensing, display, protection, SoC estimation, and runtime statistics functions into one operating system. The firmware was developed in C using STM32CubeIDE, which provides project configuration, code generation support, STM32 programming, and debugging through the ST-LINK interface \cite{ref31}. The NUCLEO-G491RE board also provides the required development and debugging resources, including accessible I/O headers and the integrated STLINK-V3E debugger/programmer \cite{ref26}.
+
+The firmware uses a bare-metal superloop structure rather than an RTOS. This was selected because the required tasks are limited, periodic, and easy to schedule using software timing. After power-on, the firmware initialises the main peripherals, including GPIO, I\textsuperscript{2}C, UART, ADC, TIM6, INA228, OLED display, MOSFET control, and Flash-related data handling. The system then performs a short initialisation stage for voltage-based SoC estimation before entering normal operation.
+
+The main loop is organised as a sequence of non-blocking module updates. Each module uses the current system tick to decide whether it should run, rather than using long blocking delays. The main tasks include button-event processing, sensor acquisition, protection control, user-interface state handling, display refresh, SoC update, and statistics update. This structure keeps the firmware readable and makes each function easier to test separately before full integration.
+
+\begin{table}[H]
+\centering
+\caption{Main firmware tasks and update periods used in the BMS demonstration platform.}
+\label{tab:firmware-tasks}
+\begin{tabular}{p{0.24\textwidth} p{0.14\textwidth} p{0.20\textwidth}}
+\hline
+\textbf{Task} & \textbf{Update method} & \textbf{Typical period} \\
+\hline
+B1 button sampling and debounce & TIM6 interrupt & 5~ms \\
+Voltage, current, and temperature update & Main-loop polling & 200~ms \\
+OLED display refresh & Main-loop polling & 250~ms \\
+SoC history update & Main-loop polling & 5~s \\
+TTE power averaging window & Circular buffer & 10~s \\
+Flash statistics save & Dirty flag and periodic save & Approximately 1~min \\
+\hline
+\end{tabular}
+\end{table}
+
+The button system is separated from the slower display and sensing tasks. TIM6 provides a fixed 5~ms timing base for button sampling and debounce processing, while the main loop converts the detected button edges into single-click or double-click events. This separation improves user-interface reliability because OLED refresh and I\textsuperscript{2}C transactions can introduce variable delays. The main loop then processes the resulting events through the user-interface state machine.
+
+The firmware state handling includes normal display operation, editable setting pages, fault state, and statistics-clear confirmation. In normal operation, the system cycles through the OLED monitoring pages and continuously updates the measured values. In setting mode, selected thresholds can be adjusted before being saved. In fault state, the MOSFET is forced off and the OLED displays the fault information. This state-based structure prevents the display, setting operation, and protection response from interfering with each other.
+
+Basic robustness measures were also included in the firmware. Sensor readings are checked before they are used in later calculations, and invalid values are prevented from directly affecting SoC estimation or protection decisions. Timing comparisons are based on tick differences rather than absolute tick values, which reduces the risk of errors when the system tick counter overflows. Flash statistics are saved using a dirty-flag strategy to avoid unnecessary erase and write operations.
+
+Overall, the firmware integration provides the link between the individual subsystems described in the previous sections. The measurement modules provide voltage, current, and temperature data; the control module evaluates protection conditions; the OLED interface presents the system state; and the Flash module stores selected runtime information. This integrated software structure allows the platform to demonstrate a complete sensing, decision-making, display, and protection process in a compact embedded implementation.
+
+
+\chapter{Overall System Test}
+
+
+\section{Test Method and Setup}
+The purpose of the overall system test was to verify that the completed platform could operate as an integrated BMS demonstration platform after full assembly. Unlike the subsystem tests in Chapter 4, this test focused on the complete operating chain, including sensing, display, user interaction, protection control, and Flash-based data retention. This is important because practical BMS operation depends on the correct integration of measurement, judgement, and protection response, rather than on isolated module performance alone [1]--[3].
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.35\textwidth]{figures/overall_system_test_procedure.png}
+    \caption{Overall system test procedure used to validate the assembled BMS demonstration platform.}
+    \label{fig:overall-test-procedure}
+\end{figure}
+
+As shown in Fig.~\ref{fig:overall-test-procedure}, the test followed an incremental procedure from subsystem completion to final validation. The 3S battery pack was connected to the custom PCB, and the positive power path first passed through the INA228 high-side measurement stage before supplying the external lamp load. The return path then came back to the PCB and passed through the MOSFET switching stage. Therefore, the same physical current path was used for voltage/current measurement, OLED display, and protection validation [5], [26], [28].
+
+The validation criteria were grouped into three levels. The first level checked basic operation, including successful power-up, OLED start-up, page switching, and valid voltage, current, and temperature readings. The second level checked integrated function, including sensor acquisition, display update, threshold evaluation, and MOSFET control. The third level checked consistency, where the displayed voltage and current were compared with multimeter readings, and the temperature response was checked under normal and heated NTC conditions.
+
+Protection behaviour was tested by heating the NTC thermistor and changing the external load. During these tests, the OLED indication, lamp-load state, and MOSFET output were observed together. Flash retention was then checked by saving runtime statistics, resetting the platform, and confirming that the stored data could still be displayed. Overall, the test confirmed that the platform operated as a complete low-cost BMS demonstration platform rather than as a set of isolated subsystems.
+
+\section{Integrated Functional Test}
+
+The integrated functional test was carried out under normal operating conditions to confirm that the assembled platform could perform monitoring, display, interaction, load control, and data handling at the same time. The system was powered by the 3S battery pack and connected to the external lamp load through the INA228 measurement path and MOSFET switching stage. During the test, the OLED pages were checked while the system was running, and the B1 button was used to cycle through the main display pages.
+
+\begin{table}[H]
+\centering
+\caption{Integrated functional test results under normal operating conditions.}
+\label{tab:integrated-functional-test}
+\begin{tabular}{p{0.25\textwidth} p{0.34\textwidth} p{0.25\textwidth}}
+\hline
+\textbf{Function checked} & \textbf{Expected behaviour} & \textbf{Observed result} \\
+\hline
+Power-up operation & System starts without entering fault state & Pass \\
+Voltage/current reading & INA228 values update on OLED & Pass \\
+Temperature reading & NTC temperature value updates normally & Pass \\
+OLED interface & Main pages display correctly & Pass \\
+B1 button operation & Pages switch in sequence & Pass \\
+MOSFET/load path & Lamp remains connected under normal condition & Pass \\
+Flash statistics & Runtime data can be displayed after reset & Pass \\
+\hline
+\end{tabular}
+\end{table}
+
+The results in Table~\ref{tab:integrated-functional-test} show that the main subsystems were able to operate together after full assembly. Voltage, current, and temperature values were updated on the OLED interface, the B1 button remained responsive, and the lamp load stayed connected when no fault condition was present. The Flash statistics page also remained accessible after reset, confirming that the data-retention function was integrated successfully. This test therefore verified the normal operating chain of the platform before the protection response was tested separately in Section~5.3.
+
+\section{Protection Response Test}
+
+The protection response test was carried out to verify that the platform could convert abnormal measurement conditions into a visible protection action. This test focused on the complete fault chain: sensor measurement, threshold judgement, OLED fault indication, and MOSFET-based load disconnection. This is a key requirement for a BMS, because monitoring data must be linked to protective action when unsafe or abnormal operating conditions are detected [1]--[3].
+
+During the test, fault conditions were introduced in a controlled way. The NTC thermistor was heated to test the temperature-related protection response, and the external load condition was changed to test current-related abnormal behaviour. When the measured value exceeded the selected protection condition, the firmware entered the fault state, forced the MOSFET output off, and displayed the fault message on the OLED interface.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.22\textwidth]{figures/oled_fault_display.png}
+    \caption{OLED fault display observed during the protection response test.}
+    \label{fig:oled-fault-display}
+\end{figure}
+
+As shown in Fig.~\ref{fig:oled-fault-display}, the OLED provided a clear local indication that the system had entered a fault condition. At the same time, the lamp load was disconnected through the MOSFET switching stage. This confirmed that the platform did not only detect abnormal measurements in software, but also produced a physical protection response through the load-control circuit. The use of a MOSFET as a controllable switching element is suitable for this demonstration-level protection function [32].
+
+\begin{table}[H]
+\centering
+\caption{Protection and warning response test results.}
+\label{tab:protection-response-test}
+\small
+\begin{tabular}{p{0.22\textwidth} p{0.28\textwidth} p{0.30\textwidth} p{0.10\textwidth}}
+\hline
+\textbf{Test item} & \textbf{Test condition} & \textbf{Expected response} & \textbf{Result} \\
+\hline
+Temperature protection & NTC heated above the temperature threshold & OLED fault indication and MOSFET load disconnection & Pass \\
+\hline
+Current protection & Load/current condition exceeded the selected current limit & Fault detection, OLED warning/fault display, and MOSFET load disconnection & Pass \\
+\hline
+Low-SoC warning & SoC value reduced below the selected low-SoC threshold & Low-SoC warning shown on OLED without immediate forced shutdown & Pass \\
+\hline
+Fault-state behaviour & Fault condition remained active after triggering & Load remained disconnected until system reset & Pass \\
+\hline
+\end{tabular}
+\end{table}
+
+The results in Table~\ref{tab:protection-response-test} show that the implemented protection chain operated correctly under the tested fault conditions. The system detected the abnormal condition, entered the fault state, updated the OLED display, and disconnected the lamp load. This verified the main protection objective of the platform. However, the test was a controlled functional validation rather than a certified safety test, so the result should be interpreted as proof of demonstration-level protection behaviour rather than industrial-grade safety compliance.
+
+\section{Summary of Test Results}
+
+The overall system test confirmed that the assembled platform achieved the main functional objectives of the low-cost BMS demonstration platform. Under normal operating conditions, the system powered up correctly, acquired voltage, current, and temperature data, updated the OLED display, responded to B1 button input, and kept the external lamp load connected through the MOSFET stage. The Flash statistics function also remained accessible after reset, showing that the runtime data-retention function was successfully integrated.
+
+The protection tests further showed that the platform could respond to abnormal operating conditions. Heating the NTC thermistor triggered the temperature-related protection response, while changing the load condition allowed the current-related protection behaviour to be checked. In these cases, the system displayed the fault condition on the OLED and disconnected the lamp load through the MOSFET stage. The low-SoC condition was also checked as a warning function, where the OLED provided a visible indication without being treated as the same type of forced shutdown fault.
+
+Overall, the test results show that the final system operated as a complete sensing, display, judgement, protection, and data-retention chain. However, the validation was limited to short-duration laboratory functional testing. It did not include long-term reliability testing, certified safety assessment, full calibration over temperature, or operation across different battery ageing conditions. Therefore, the results demonstrate that the platform is suitable for educational demonstration and prototype-level validation, but they should not be interpreted as evidence of industrial-grade BMS compliance.
+
+\clearpage
+\chapter{Discussion, Conclusion and Further Work}
+
+
+\section{Key Project Outcomes}
+
+The final system successfully passed both the individual subsystem tests and the overall integrated system test. This shows that the platform can operate as a complete and reliable BMS demonstration platform under the tested laboratory conditions. The key project outcomes can be summarised as follows.
+
+\subsection*{1. Integrated Monitoring Function}
+
+The platform successfully implemented the three core monitoring functions required for a basic BMS demonstration: voltage, current and temperature measurement. The INA228 was used for compact digital voltage and current measurement, avoiding the need for a complex discrete analogue front-end \cite{ref5}, \cite{ref28}. The NTC thermistor provided a low-cost temperature sensing method, and its measured resistance--temperature behaviour was shown to follow the expected calculated trend. These sensing functions formed the measurement basis for display, warning and protection decisions.
+
+\subsection*{2. Observable User Interface and Runtime Information}
+
+The OLED display allowed the measured values and system state to be shown locally without requiring an external computer. Voltage, current, temperature, SoC indication, fault information and runtime statistics could be viewed directly through the page-based interface. The B1 button also provided simple user interaction for page switching and setting access. In addition, the Flash-based runtime statistics allowed selected historical information to be retained after reset, improving the observability of the platform.
+
+\subsection*{3. Functional Protection Response}
+
+The MOSFET load-control stage successfully converted software protection decisions into a physical load-disconnection action. Under abnormal temperature, current or low-SoC conditions, the firmware could enter a fault state and disconnect the lamp load through the MOSFET. This demonstrated the complete protection chain from measurement, threshold judgement and OLED indication to physical output control.
+
+\subsection*{4. Low-Cost and Expandable Demonstration Platform}
+
+A major outcome of the project is the development of a low-cost and practical hardware platform. Inexpensive components such as the NTC thermistor, OLED display and MOSFET were integrated with the custom PCB to reduce wiring complexity. Mature modules such as the NUCLEO-G491RE and INA228 also reduced implementation risk. The NUCLEO-G491RE provides sufficient GPIO, ADC, I\textsuperscript{2}C, timer and Flash resources for the current system and future expansion \cite{ref26}. The transparent mounting base further improved the demonstration value by making the battery pack, PCB, controller, wiring and load path easy to observe during testing.
+
+Overall, these outcomes show that the project achieved its main aim: to build a low-cost, observable and testable embedded BMS demonstration platform that links measurement, display, judgement, protection and runtime data handling in one complete system.
+
+\section{Limitations and Trade-Offs}
+
+Several trade-offs were made during the project. The final platform is larger and less compact than a commercial BMS, but this was acceptable because visibility and debugging access were more important for a demonstration platform. The transparent base and separated hardware layout made the system easier to inspect, explain and test, although this also means that the current platform is not designed as a miniaturised product.
+
+The firmware also used a bare-metal superloop rather than an RTOS. This simplified the software implementation and was sufficient for the present monitoring and protection functions. However, OLED refresh and I\textsuperscript{2}C communication can sometimes affect the timing precision of B1 button response. Therefore, the current firmware structure is suitable for this demonstration platform, but it is less scalable than a task-based real-time design.
+
+The project scope was also deliberately limited. Cell balancing, charging control and certified safety protection were not implemented because they would require extra hardware and longer validation. The SoC function was included mainly as a supporting display and state-indication feature, and its algorithm was kept lightweight rather than model-intensive. However, the low-SoC condition can still participate in the protection logic and trigger a forced shutdown fault when the selected threshold is reached.
+
+The protection test was functional rather than long-term reliability testing. The system was tested under controlled laboratory conditions, but it was not tested under long-duration operation, vibration, enclosure constraints, or certified safety conditions. Therefore, the final system should be understood as a reliable educational and prototype-level BMS demonstration platform under tested conditions, not as an industrial BMS product.
+
+\section{Conclusion and Future Work}
+
+This project achieved its main aim by designing, building and testing a low-cost embedded BMS demonstration platform. The final system successfully demonstrated the core operating chain of a basic BMS, including voltage, current and temperature measurement, OLED-based status display, user interaction, MOSFET-based load protection, simplified SoC indication and Flash-based runtime statistics. The project therefore provides a clear and practical platform for demonstrating how sensing, judgement, display and protection can be linked in an embedded battery monitoring system.
+
+The first area for future work is multi-cell and multi-sensor expansion. The present platform mainly demonstrates pack-level monitoring for a 3S battery pack. For a larger battery system, such as an automotive-style battery module, one voltage/current sensor and one temperature sensor would not be sufficient. Future development should therefore move towards cell-group-level or module-level monitoring, with multiple voltage, current and temperature sensing points distributed across the battery system. The available GPIO, ADC and I\textsuperscript{2}C resources of the STM32 platform provide a basis for this type of expansion.
+
+The second improvement is the use of an RTOS-based firmware structure. As more functions are added, tasks such as sensing, display refresh, button handling, protection logic, data storage and communication should be separated more clearly. An RTOS would improve timing control, task priority management and software scalability, especially because OLED refresh and I\textsuperscript{2}C communication can affect the timing precision of user interaction in the current superloop design.
+
+The third area is wireless or PC-based monitoring. At present, the OLED provides local display only. Future versions could add Bluetooth, USB serial logging or another communication interface so that voltage, current, temperature, SoC, fault state and runtime statistics can be displayed on a computer or mobile device. This would improve data visibility, make long-term testing easier, and allow the platform to act as a more useful laboratory monitoring tool.
+
+The final area is the addition of cell balancing and charging control. These functions were not included in the present project because they require extra hardware and more detailed safety validation. However, they are important functions in a more complete BMS. Future work could add passive balancing circuits, cell-level over-voltage and under-voltage monitoring, charger enable/disable control and safer charge termination logic. This would move the platform from a monitoring and protection demonstrator towards a more complete BMS development platform.
+\clearpage
+\chapter*{References}
+\addcontentsline{toc}{chapter}{References}
+
+{\sloppy\hbadness=10000\relax
+\begin{thebibliography}{99}
+
+\bibitem{ref1}
+J. Peng et al., ``Enhancing lithium-ion battery monitoring: A critical review of diverse sensing approaches,'' \emph{eTransportation}, vol.~22, Art.~no.~100360, 2024, doi: 10.1016/j.etran.2024.100360.
+
+\bibitem{ref2}
+H. A. Gabbar, A. M. Othman, and M. Abdussami, ``Review of Battery Management Systems (BMS) Development and Industrial Standards,'' \emph{Technologies}, vol.~9, no.~2, Art.~no.~28, 2021, doi: 10.3390/technologies9020028.
+
+\bibitem{ref3}
+A. K. M. A. Habib, M. M. Hasan, M. S. Islam, S. M. A. Rahat, M. A. K. M. Sarker, and A. M. T. Oo, ``Lithium-Ion Battery Management System for Electric Vehicles: Constraints, Challenges, and Recommendations,'' \emph{Batteries}, vol.~9, no.~3, Art.~no.~152, 2023, doi: 10.3390/batteries9030152.
+
+\bibitem{ref4}
+M. Lelie, T. Braun, M. Knips, H. Nordmann, F. Ringbeck, H. Zappen, and D. U. Sauer, ``Battery Management System Hardware Concepts: An Overview,'' \emph{Applied Sciences}, vol.~8, no.~4, Art.~no.~534, 2018, doi: 10.3390/app8040534.
+
+\bibitem{ref5}
+Texas Instruments, \emph{INA228 85-V, 20-Bit Ultra-Precise Power/Energy/Charge Monitor With I2C Interface}, datasheet, Texas Instruments, Dallas, TX, USA, 2022.
+
+\bibitem{ref6}
+STMicroelectronics, \emph{STM32G491xC STM32G491xE Arm® Cortex®-M4 32-bit MCU+FPU microcontrollers datasheet}, STMicroelectronics, Geneva, Switzerland, 2024.
+
+\bibitem{ref7}
+STMicroelectronics, \emph{How to optimize the ADC accuracy in the STM32 MCUs}, application note AN2834, STMicroelectronics, Geneva, Switzerland, 2024.
+
+\bibitem{ref8}
+M. Uzair, G. Abbas, and S. Hosain, ``Characteristics of Battery Management Systems of Electric Vehicles with Consideration of the Active and Passive Cell Balancing Process,'' \emph{World Electric Vehicle Journal}, vol.~12, no.~3, Art.~no.~120, 2021, doi: 10.3390/wevj12030120.
+
+\bibitem{ref9}
+G. Krishna, R. Singh, A. Gehlot, S. V. Akram, N. Priyadarshi, and B. Twala, ``Digital Technology Implementation in Battery-Management Systems for Sustainable Energy Storage: Review, Challenges, and Recommendations,'' \emph{Electronics}, vol.~11, no.~17, Art.~no.~2695, 2022, doi: 10.3390/electronics11172695.
+
+\bibitem{ref10}
+K. Okay, S. Eray, and A. Eray, ``Development of prototype battery management system for PV system,'' \emph{Renewable Energy}, vol.~181, pp.~1294--1304, 2022, doi: 10.1016/j.renene.2021.09.118.
+
+\bibitem{ref11}
+N. Khan, C. A. Ooi, A. Alturki, M. Amir, Shreasth, and T. Alharbi, ``A critical review of battery cell balancing techniques, optimal design, converter topologies, and performance evaluation for optimizing storage system in electric vehicles,'' \emph{Energy Reports}, vol.~11, pp.~4999--5032, 2024, doi: 10.1016/j.egyr.2024.04.041.
+
+\bibitem{ref12}
+A. Gharehghani, M. Rabiei, S. Mehranfar, S. Saeedipour, A. M. Andwari, A. García, and C. Mico Reche, ``Progress in battery thermal management systems technologies for electric vehicles,'' \emph{Renewable and Sustainable Energy Reviews}, vol.~202, Art.~no.~114654, 2024, doi: 10.1016/j.rser.2024.114654.
+\bibitem{ref13}
+L. Lu, X. Han, J. Li, J. Hua, and M. Ouyang, ``A review on the key issues for lithium-ion battery management in electric vehicles,'' \emph{Journal of Power Sources}, vol.~226, pp.~272--288, 2013, doi: 10.1016/j.jpowsour.2012.10.060.
+
+\bibitem{ref14}
+M. A. Hannan, M. S. H. Lipu, A. Hussain, and A. Mohamed, ``A review of lithium-ion battery state of charge estimation and management system in electric vehicle applications: Challenges and recommendations,'' \emph{Renewable and Sustainable Energy Reviews}, vol.~78, pp.~834--854, 2017, doi: 10.1016/j.rser.2017.05.001.
+
+\bibitem{ref15}
+W.-Y. Chang, ``The state of charge estimating methods for battery: A review,'' \emph{ISRN Applied Mathematics}, vol.~2013, Art.~no.~953792, 2013, doi: 10.1155/2013/953792.
+
+\bibitem{ref16}
+Y. Xing, W. He, M. Pecht, and K. L. Tsui, ``State of charge estimation of lithium-ion batteries using the open-circuit voltage at various ambient temperatures,'' \emph{Applied Energy}, vol.~113, pp.~106--115, 2014, doi: 10.1016/j.apenergy.2013.07.008.
+
+\bibitem{ref17}
+F. Mohammadi, A. Nazri, and M. Saif, ``Lithium-ion battery state of charge estimation based on an improved Coulomb-counting algorithm and uncertainty evaluation,'' \emph{Journal of Energy Storage}, vol.~48, Art.~no.~103967, 2022, doi: 10.1016/j.est.2022.103967.
+
+\bibitem{ref18}
+A. Gismero, J. Schaltz, and D.-I. Stroe, ``Recursive state of charge and state of health estimation method for lithium-ion batteries based on Coulomb counting and open circuit voltage,'' \emph{Energies}, vol.~13, no.~7, Art.~no.~1811, 2020, doi: 10.3390/en13071811.
+
+\bibitem{ref19}
+K. W. See, G. Wang, Y. Zhang, Y. Zhao, and M. Agelin-Chaab, ``Critical review and functional safety of a battery management system for large-scale lithium-ion battery pack technologies,'' \emph{International Journal of Energy Research}, 2022, doi: 10.1007/s40789-022-00494-0.
+
+\bibitem{ref20}
+International Electrotechnical Commission, \emph{IEC 62619:2022 Secondary cells and batteries containing alkaline or other non-acid electrolytes -- Safety requirements for secondary lithium cells and batteries, for use in industrial applications}, IEC, Geneva, Switzerland, 2022.
+
+\bibitem{ref21}
+A. Tomaszewska et al., ``Lithium-ion battery fast charging: A review,'' \emph{eTransportation}, vol.~1, Art.~no.~100011, 2019, doi: 10.1016/j.etran.2019.100011.
+
+\bibitem{ref22}
+D. Rimpas, V. A. Orfanos, P. Chalkiadakis, and I. Christakis, ``Design and development of a low-cost and compact real-time monitoring tool for battery life calculation,'' \emph{Engineering Proceedings}, vol.~58, no.~1, Art.~no.~17, 2023, doi: 10.3390/ecsa-10-16146.
+
+\bibitem{ref23}
+A. Burgio, D. Cimmino, A. Nappo, L. Smarrazzo, and G. Donatiello, ``An IoT-based solution for monitoring and controlling battery energy storage systems at residential and commercial levels,'' \emph{Energies}, vol.~16, no.~7, Art.~no.~3140, 2023, doi: 10.3390/en16073140.
+
+\bibitem{ref24}
+Y. Ethman, M. Elbastawesy, M. Emad, I. Younes, B. I. Al-Hosseny, O. Matar, F. Ahmed, S. Kaddah, and B. M. Badr, ``Design low-cost battery management system for low power applications of photovoltaic systems,'' in \emph{2023 IEEE Conference on Power Electronics and Renewable Energy (CPERE)}, 2023, pp.~1--6, doi: 10.1109/CPERE56564.2023.10119604.
+
+\bibitem{ref25}
+R. Xiong, Q. Yu, and L. Y. Wang, ``Open circuit voltage and state of charge online estimation for lithium ion batteries,'' \emph{Energy Procedia}, vol.~142, pp.~1902--1907, 2017, doi: 10.1016/j.egypro.2017.12.388.
+
+
+\bibitem{ref26}
+STMicroelectronics, \emph{STM32G4 Nucleo-64 boards (MB1367): NUCLEO-G431RB, NUCLEO-G474RE and NUCLEO-G491RE}, user manual UM2505, Rev.~5, STMicroelectronics, Geneva, Switzerland, 2025.
+
+\bibitem{ref27}
+STMicroelectronics, \emph{STM32G4 Series advanced Arm®-based 32-bit MCUs}, reference manual RM0440, STMicroelectronics, Geneva, Switzerland, 2025.
+
+\bibitem{ref28}
+Adafruit Industries, \emph{Adafruit INA228 I2C Power Monitor}, technical guide, Adafruit Industries, New York, NY, USA, 2025.
+
+\bibitem{ref29}
+Solomon Systech, \emph{SSD1306 128 × 64 Dot Matrix OLED/PLED Segment/Common Driver with Controller}, datasheet, Rev.~1.1, Solomon Systech Ltd., Hong Kong, 2008.
+
+\bibitem{ref30}
+TDK Electronics, \emph{B57863S0103G040 NTC Thermistor, 10 k$\Omega$, B57863S Series, B25/100 = 3988 K, Through-Hole Wire-Leaded}, datasheet, TDK Electronics AG, Munich, Germany.
+
+\bibitem{ref31}
+STMicroelectronics, \emph{STM32CubeIDE release v1.19.0}, release note RN0114, Rev.~35, STMicroelectronics, Geneva, Switzerland, 2025.
+
+\bibitem{ref32}
+Infineon Technologies, \emph{IRLZ44NPbF HEXFET® Power MOSFET}, datasheet PD-94831, Infineon Technologies / International Rectifier, 2003.
+
+\bibitem{ref33}
+Texas Instruments, \emph{LM2596 SIMPLE SWITCHER® Power Converter 150-kHz 3-A Step-Down Voltage Regulator}, datasheet, Texas Instruments, Dallas, TX, USA, 2023.
+
+\end{thebibliography}
+}
+
+
+
+\appendix
+
+
+% =========================
+% Appendix A
+% =========================
+\clearpage
+\includepdf[
+    pages=1,
+    scale=0.82,
+    offset=0 -1.3cm,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix A: Preliminary Project Proposal and Project Plan}
+        \addcontentsline{toc}{section}{Appendix A: Preliminary Project Proposal and Project Plan}
+    }
+]{proposal.pdf}
+
+\includepdf[
+    pages=2-,
+    pagecommand={\thispagestyle{plain}}
+]{proposal.pdf}
+
+% =========================
+% Appendix B
+% =========================
+\clearpage
+\includepdf[
+    pages=1,
+    scale=0.82,
+    offset=0 -1.3cm,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix B: Risk Register}
+        \addcontentsline{toc}{section}{Appendix B: Risk Register}
+    }
+]{Risk Register.PDF}
+
+\includepdf[
+    pages=2-,
+    pagecommand={\thispagestyle{plain}}
+]{Risk Register.PDF}
+
+% =========================
+% Appendix C
+% =========================
+\clearpage
+\includepdf[
+    pages=1,
+    scale=0.82,
+    offset=0 -1.3cm,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix C: Continuing Professional Development Log}
+        \addcontentsline{toc}{section}{Appendix C: Continuing Professional Development Log}
+    }
+]{04_CPD_Log.pdf}
+
+\includepdf[
+    pages=1-,
+    pagecommand={\thispagestyle{plain}}
+]{04_CPD_Log.pdf}
+
+% =========================
+% Appendix D
+% =========================
+\clearpage
+\includepdf[
+    pages=1,
+    scale=0.82,
+    offset=0 -1.3cm,
+    pagecommand={
+        \thispagestyle{plain}
+        \section*{Appendix D: Health and Safety Risk Assessment}
+        \addcontentsline{toc}{section}{Appendix D: Health and Safety Risk Assessment}
+    }
+]{02_HS_Risk_Assessment.pdf}
+
+\includepdf[
+    pages=2-,
+    pagecommand={\thispagestyle{plain}}
+]{02_HS_Risk_Assessment.pdf}
+
+% =========================
+% Appendix E
+% =========================
+\clearpage
+\section*{Appendix E: GitHub Repository Link}
+\addcontentsline{toc}{section}{Appendix E: GitHub Repository Link}
+
+The source code repository for this project is available at:
+
+\begin{quote}
+\url{https://github.com/1zehaoyu1/individual-project}
+\end{quote}
+
+The repository contains the embedded software developed for the BMS demonstration platform, including the STM32-based firmware for sensor acquisition, OLED display, user interaction, MOSFET-based protection control, simplified State-of-Charge indication, and Flash-based runtime statistics.
+\end{document}
+
