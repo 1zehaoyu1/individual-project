@@ -150,7 +150,7 @@ static uint8_t soc_inited = 0;     /* SOC 是否已初始化（0=未初始化，
 /* ===== F2: 运行时可调阈值 ===== */
 /* 设置持久化开关：设为 1 开机从 Flash 加载上次保存的阈值；设为 0 每次恢复默认值 */
 /* 当前默认关闭（=0），避免 Flash 擦写次数耗尽，调试稳定后再启用 */
-#define ENABLE_SETTINGS_PERSISTENCE  0
+#define ENABLE_SETTINGS_PERSISTENCE  1
 
 /* 三个运行时可调阈值变量（在 F2 设置模式下可修改） */
 static float g_mosfet_off_temp = TEMP_MOSFET_OFF_C_DEFAULT;  /* MOSFET 断开温度阈值（°C） */
